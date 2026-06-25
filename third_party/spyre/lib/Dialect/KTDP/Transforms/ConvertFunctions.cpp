@@ -39,6 +39,25 @@ struct ConvertTTReturn : public OpConversionPattern<triton::ReturnOp> {
   }
 };
 
+/// tt.call -> func.call
+///
+/// A SpyreTritonKernelBundle entry tt.func calls each bundled kernel via
+/// tt.call.  Once convertFunctions() turns the callee tt.funcs into func.funcs,
+/// a surviving tt.call no longer references a tt.func and fails verification
+/// ("does not reference a valid function").  Rewrite the call into the func
+/// dialect so it references the converted callee.
+struct ConvertTTCall : public OpConversionPattern<triton::CallOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::CallOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<func::CallOp>(
+        op, op.getCallee(), op.getResultTypes(), adaptor.getOperands());
+    return success();
+  }
+};
+
 struct ConvertFunctionsPass
     : public mlir::triton::ktdp::impl::ConvertFunctionsBase<
           ConvertFunctionsPass> {
@@ -54,9 +73,10 @@ struct ConvertFunctionsPass
     target.addLegalDialect<arith::ArithDialect>();
     target.addLegalOp<ModuleOp>();
     target.addIllegalOp<triton::ReturnOp>();
+    target.addIllegalOp<triton::CallOp>();
 
     RewritePatternSet patterns(ctx);
-    patterns.add<ConvertTTReturn>(ctx);
+    patterns.add<ConvertTTReturn, ConvertTTCall>(ctx);
 
     if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
       module.emitError("ConvertFunctions: failed to convert tt.return ops");
