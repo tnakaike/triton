@@ -4,7 +4,10 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/ArrayRef.h"
+#include <map>
 #include <memory>
+#include <string>
+#include <vector>
 
 namespace mlir::triton::ktdp {
 
@@ -19,7 +22,8 @@ std::unique_ptr<OperationPass<ModuleOp>> createConvertFunctionsPass();
 std::unique_ptr<OperationPass<ModuleOp>> createLowerDescriptorMemoryPass();
 std::unique_ptr<OperationPass<ModuleOp>> createLowerComputeOpsPass();
 std::unique_ptr<OperationPass<ModuleOp>> createDistributeWorkPass(
-    llvm::ArrayRef<int64_t> grid = {});
+    llvm::ArrayRef<int64_t> grid = {},
+    const std::map<std::string, std::vector<int64_t>> &grids = {});
 
 } // namespace mlir::triton::ktdp
 

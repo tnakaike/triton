@@ -21,6 +21,9 @@
 #include "mlir/Pass/PassManager.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <map>
+#include <string>
+#include <vector>
 
 namespace py = pybind11;
 
@@ -50,9 +53,10 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
     pm.addPass(mlir::triton::ktdp::createConvertFunctionsPass());
   });
   m.def("add_distribute_work",
-        [](mlir::PassManager &pm, const std::vector<int64_t> &grid) {
+        [](mlir::PassManager &pm, const std::vector<int64_t> &grid,
+           const std::map<std::string, std::vector<int64_t>> &grids) {
           pm.addPass(
-              mlir::triton::ktdp::createDistributeWorkPass(grid));
+              mlir::triton::ktdp::createDistributeWorkPass(grid, grids));
         });
 }
 

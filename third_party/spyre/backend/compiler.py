@@ -14,6 +14,12 @@ class SpyreOptions:
     # case. A 2D kernel with grid = (16, 2) would partition the same
     # 32 cores as 16x2 across axes x and y.
     grid: Tuple[int, ...] = (32,)
+    # Per-function grid overrides for kernel bundles, as a tuple-of-pairs
+    # ((fn_name, (g0, g1, ...)), ...). A bundle mixes members of differing pid
+    # rank (2D native-matmul + 1D pointwise); DistributeWork distributes each
+    # named function on its own grid, falling back to `grid` for any function
+    # not listed. Empty for standalone kernels (single-grid path, unchanged).
+    grids: Tuple = ()
     lx_size: int = 2 * 1024 * 1024  # 2 MB scratchpad per core
     # Required by Triton code generator
     sanitize_overflow: bool = False
@@ -127,10 +133,12 @@ class SpyreBackend(BaseBackend):
         from triton._C.libtriton import ir, passes, spyre
 
         grid = list(options.grid)
+        # Per-function grid overrides (kernel bundles); empty -> `grid` fallback.
+        grids = {name: list(g) for name, g in options.grids}
 
         pm = ir.pass_manager(mod.context)
         spyre.passes.ttir_to_ktdp.add_convert_ttir_to_ktdp(pm)
-        spyre.passes.ttir_to_ktdp.add_distribute_work(pm, grid)
+        spyre.passes.ttir_to_ktdp.add_distribute_work(pm, grid, grids)
         # Clean up redundant arithmetic (fold muli x,1; simplify cast chains)
         passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)

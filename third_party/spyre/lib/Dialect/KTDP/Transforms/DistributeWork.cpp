@@ -12,12 +12,15 @@
 // result that matches its axis. tt.get_num_programs is folded against
 // the same grid, so both ops share a single source of truth.
 //
-// Limitation: one grid per pass run. Every function in the module must
-// share the same grid rank / shape (the pass takes a single
-// ArrayRef<int64_t> grid option). This is fine for today's
-// one-kernel-per-module compilation model but needs a per-function
-// spyre.grid attribute before we compile mixed-rank modules. See
-// PLAN_kernel_examples.md G4.
+// Per-function grids: the pass takes an optional map from function symbol
+// name to grid (in addition to the single `grid` fallback). A function
+// listed in the map is distributed on its own grid; any function not listed
+// falls back to `grid`. This lets a kernel bundle mix members of differing
+// pid rank in one module — e.g. a 2D native-matmul member (grid [1, 1])
+// alongside 1D pointwise members (grid [1]) and a pid-less entry (grid [1]).
+// The map is keyed by the FunctionOpInterface symbol name, which the Triton
+// frontend emits as triton_bundle_<id> (entry) / triton_bundle_<id>_kernel_<i>
+// (members) and ConvertFunctions preserves.
 //
 // Before:                              After:
 //   %px = tt.get_program_id x : i32      %px_i, %py_i = ktdp.get_compute_tile_id
@@ -46,6 +49,9 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/SmallVector.h"
+#include <map>
+#include <string>
+#include <vector>
 
 using namespace mlir;
 
@@ -68,6 +74,19 @@ struct DistributeWorkPass
     grid = gridShape;
   }
 
+  DistributeWorkPass(ArrayRef<int64_t> gridShape,
+                     const std::map<std::string, std::vector<int64_t>> &gridMapArg)
+      : gridMap(gridMapArg) {
+    grid = gridShape;
+  }
+
+  // Per-function grid overrides (function symbol name -> grid). Empty for the
+  // single-grid path; a function not listed falls back to the `grid` option.
+  // A plain member (not a tablegen option, which can't carry a map); the
+  // implicit copy constructor copies it alongside the base options so pass
+  // cloning preserves per-function grids.
+  std::map<std::string, std::vector<int64_t>> gridMap;
+
   void runOnOperation() override {
     ModuleOp module = getOperation();
 
@@ -83,6 +102,27 @@ struct DistributeWorkPass
     // processed once: gather its pid ops, then either distribute (if
     // any) or stamp the single-program grid (if none).
     module.walk([&](FunctionOpInterface fn) {
+      // Resolve this function's grid: a per-function override from the map
+      // (kernel bundles) if present, else the single `grid` fallback.
+      //
+      // Triton mangles the noinline bundle-member helpers as
+      //   <module path>.<base-name>__<arg-specialization>
+      // (e.g. torch._inductor.runtime.compile_tasks.<hash>.
+      //  triton_bundle_0_kernel_1__Pfp16_Pfp16_c128_...), while the entry keeps
+      // its clean public name. Recover <base-name> — the key torch-spyre used
+      // in spyre_grids — by taking the text after the last '.' and before the
+      // "__" specialization suffix, then look it up in the map.
+      StringRef base = fn.getName();
+      if (size_t dot = base.rfind('.'); dot != StringRef::npos)
+        base = base.drop_front(dot + 1);
+      if (size_t us = base.find("__"); us != StringRef::npos)
+        base = base.take_front(us);
+
+      ArrayRef<int64_t> fnGrid = grid;
+      auto it = gridMap.find(base.str());
+      if (it != gridMap.end())
+        fnGrid = it->second;
+
       SmallVector<triton::GetProgramIdOp> pids;
       SmallVector<triton::GetNumProgramsOp> nprogs;
       fn.walk([&](Operation *op) {
@@ -101,7 +141,7 @@ struct DistributeWorkPass
         fn->setAttr("grid", builder.getI64ArrayAttr({1}));
         return;
       }
-      distributeInFunction(fn.getOperation(), pids, nprogs);
+      distributeInFunction(fn.getOperation(), pids, nprogs, fnGrid);
     });
   }
 
@@ -150,9 +190,14 @@ private:
   //
   // Finally, stamp a `grid` attribute on the enclosing function so
   // downstream passes / the runtime can see the partition shape.
+  // `grid` is the resolved per-function grid (see runOnOperation); it shadows
+  // the pass member so the body below distributes each function on its own
+  // grid — the rank check (c), the num_programs fold, and the grid stamp all
+  // key off it.
   void distributeInFunction(Operation *fnOp,
                             ArrayRef<triton::GetProgramIdOp> pids,
-                            ArrayRef<triton::GetNumProgramsOp> nprogs) {
+                            ArrayRef<triton::GetNumProgramsOp> nprogs,
+                            ArrayRef<int64_t> grid) {
     // --- Step 0: validate the kernel's grid contract -----------------
     // Triton's tt.get_program_id.axis and tt.get_num_programs.axis are
     // both i32 attributes in {0, 1, 2}. We enforce three invariants on
@@ -302,7 +347,8 @@ private:
 
 namespace mlir::triton::ktdp {
 std::unique_ptr<OperationPass<ModuleOp>>
-createDistributeWorkPass(ArrayRef<int64_t> grid) {
-  return std::make_unique<DistributeWorkPass>(grid);
+createDistributeWorkPass(ArrayRef<int64_t> grid,
+                         const std::map<std::string, std::vector<int64_t>> &grids) {
+  return std::make_unique<DistributeWorkPass>(grid, grids);
 }
 } // namespace mlir::triton::ktdp
