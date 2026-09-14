@@ -24,9 +24,9 @@ Quick-reference
                                   from ``test/fixtures/*/meta.py``
 - :class:`KTIRCpuTester`        — EXAMPLE-based setup + numerical CPU execution
 
-Most shared machinery (``OpInfo``, ``walk_module``, ``make_ktir_mod``,
-``compile_to_ttir``) lives in :mod:`utils` — this file re-exports the names
-so existing test modules can keep importing them from ``conftest``.
+Most shared machinery (``compile_to_ttir``, ``make_ktir_mod``) lives in
+:mod:`utils` — this file re-exports the names so existing test modules can
+keep importing them from ``conftest``.
 
 Troubleshooting
 ---------------
@@ -88,10 +88,8 @@ _FIXTURES_DIR = _TEST_DIR / "fixtures"
 
 # Re-export helpers from utils so tests can still import them from conftest.
 from utils import (  # noqa: E402
-    OpInfo,
     compile_to_ttir,
     make_ktir_mod,
-    walk_module,
 )
 
 
@@ -520,26 +518,6 @@ def _load_examples():
             # param_values) don't leak into resolved[] and corrupt later
             # base merges.
             merged = dict(_resolve_base(vname))
-
-            # Disabled variants: one entry, no expansion.
-            if merged.get("disabled"):
-                # Which means the raw ``params`` survive into the registry
-                # un-expanded. The group form only has meaning once expansion
-                # zips its names together, so a tuple key here would reach every
-                # consumer as an uninterpreted tuple. Refused at the source
-                # rather than left to be mis-read downstream.
-                grouped = [k for k in merged.get("params", {})
-                           if isinstance(k, tuple)]
-                if grouped:
-                    raise ValueError(
-                        f"{name}::{vname}: a disabled variant skips param "
-                        f"expansion and keeps its 'params' raw, so it cannot use "
-                        f"the group form; {grouped} must be spelled as separate "
-                        f"single-name keys."
-                    )
-                key = name if vname == "default" else f"{name}__{vname}"
-                registry[key] = merged
-                continue
 
             merged_params = merged.get("params", {})
             combos, suffix_names = _expand_params(
