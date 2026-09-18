@@ -25,7 +25,7 @@
 // Tensor-of-pointers `tt.load` (pointer operand shaped as a tensor of
 // `!tt.ptr<ElemT>`) is out of scope for this pass and remains
 // legal/untouched; see `[LowerPointerChainMemory]` (not yet implemented,
-// Passes.td pipeline diagram) for that path.
+// Conversion/TritonToKTIR/Passes.td pipeline diagram) for that path.
 //
 // Pass-ordering note: when a scalar `tt.load` result feeds a dynamic shape
 // operand of `tt.make_tensor_descriptor`, `LowerDescriptorMemory` reaches
@@ -47,8 +47,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "Dialect/KTDP/Transforms/Passes.h"
-#include "Dialect/KTDP/Transforms/Utility.h"
+#include "Conversion/TritonToKTIR/Passes.h"
+#include "Dialect/KTDP/Utils/Utility.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 #include "ktir/Dialect/KTDP/KTDPAttrs.h"
 #include "ktir/Dialect/KTDP/KTDPDialect.h"
@@ -69,7 +69,7 @@ using namespace mlir;
 
 namespace mlir::triton::ktdp {
 #define GEN_PASS_DEF_LOWERSCALARLOAD
-#include "Dialect/KTDP/Transforms/Passes.h.inc"
+#include "Conversion/TritonToKTIR/Passes.h.inc"
 } // namespace mlir::triton::ktdp
 
 namespace {

@@ -10,7 +10,13 @@
 #include "ktir/Dialect/KTDP/KTDP.h"
 #include "ktir/Dialect/KTDP/KTDPDialect.h"
 #include "ktir/Dialect/SpyreOp/SpyreOpDialect.h"
+// All three pass groups: this file reaches create* entry points from each --
+// the conversions and the top-level transforms by their hand-declared
+// factories, RewriteDescriptorLayout through the options struct tablegen
+// generates into the KTDP transforms header.
+#include "Conversion/TritonToKTIR/Passes.h"
 #include "Dialect/KTDP/Transforms/Passes.h"
+#include "Transforms/Passes.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Passes.h"
 #include "mlir/Dialect/Math/IR/Math.h"
@@ -52,7 +58,8 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
   // run after it, added separately by the `ktir` stage in
   // third_party/spyre/backend/compiler.py.
   //
-  // Ordering constraints (each pass also states its own in Passes.td):
+  // Ordering constraints (each pass also states its own, in the Passes.td of
+  // whichever of the three libraries it belongs to):
   // ConvertFunctions runs last because it replaces !tt.ptr args with index;
   // memory passes must consume !tt.ptr via getBasePtrAsIndex/ptrToIndex first.
   // LowerInterTile runs after LowerComputeOps (partials are linalg/tensor),

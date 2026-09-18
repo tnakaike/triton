@@ -61,8 +61,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "Dialect/KTDP/Transforms/Passes.h"
-#include "Dialect/KTDP/Transforms/Utility.h"
+#include "Transforms/Passes.h"
+#include "Dialect/KTDP/Utils/Utility.h"
 
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -79,7 +79,7 @@ using namespace mlir;
 
 namespace mlir::triton::ktdp {
 #define GEN_PASS_DEF_UNALIASLINALGOUTS
-#include "Dialect/KTDP/Transforms/Passes.h.inc"
+#include "Transforms/Passes.h.inc"
 } // namespace mlir::triton::ktdp
 
 namespace {

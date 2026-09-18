@@ -18,8 +18,12 @@ add_subdirectory(bin)
 add_subdirectory(test)
 
 if(TRITON_BUILD_PYTHON_MODULE)
+  # MLIRLinalgTransforms is for this file's own
+  # createConvertElementwiseToLinalgPass, which the plugin exposes as
+  # add_convert_elementwise_to_linalg.  
   add_triton_plugin(TritonSpyre
     ${CMAKE_CURRENT_SOURCE_DIR}/triton_spyre.cc
-    LINK_LIBS KTDPTransforms KTIR::KtdpDialect)
+    LINK_LIBS TritonToKTIR KTDPTransforms SpyreTransforms
+              KTIR::KtdpDialect MLIRLinalgTransforms)
   target_link_libraries(TritonSpyre PRIVATE Python3::Module pybind11::headers)
 endif()

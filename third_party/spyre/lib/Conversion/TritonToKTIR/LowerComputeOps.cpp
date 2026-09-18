@@ -11,8 +11,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "Dialect/KTDP/Transforms/Passes.h"
-#include "Dialect/KTDP/Transforms/Utility.h"
+#include "Conversion/TritonToKTIR/Passes.h"
+#include "Dialect/KTDP/Utils/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -31,7 +31,7 @@ using namespace mlir;
 
 namespace mlir::triton::ktdp {
 #define GEN_PASS_DEF_LOWERCOMPUTEOPS
-#include "Dialect/KTDP/Transforms/Passes.h.inc"
+#include "Conversion/TritonToKTIR/Passes.h.inc"
 } // namespace mlir::triton::ktdp
 
 namespace {
