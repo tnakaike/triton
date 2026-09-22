@@ -12,11 +12,11 @@ Four operations are supported via `OP: tl.constexpr`: `add`, `sub`, `mul`, `div`
 Level D  device              fp16/fp32 × {add,sub,mul}         compiles_to_binary
          1d_device            2 keys (fp16, 1 layout)              [Stage 3]
 
-Level C  layout               fp16 stick physicalization
+Level C  layout               fp16 annotated (physical form: lit + Level D)
          2d_spyre_stick        1 key (fp16)
 
 Level B  compute              fp16/fp32/i32 × {add,sub,mul,div}
-         1d_compute           12 keys (ktir_cpu only; div+i32 stop here: #107)
+         1d_compute           12 keys (ktir_cpu only; div+i32 stop here)
 
 Level A  shape                fp32, add  (OP and DTYPE pinned)
          default, dynamic, 2d, 2d_dynamic, 2d_grid,
@@ -55,10 +55,17 @@ Level A  shape                fp32, add  (OP and DTYPE pinned)
 
 ### Level B — compute correctness (OP × DTYPE sweep)
 
-- **1d_compute** (`elementwise__1d_compute[DTYPE=..., OP=...]`) — 12 keys
-  sweeping `fp16/fp32/i32` × `add/sub/mul/div`. The simplest possible shape
-  (1D, 128 elements, single core) so only the arithmetic varies. ktir_cpu only;
-  `div` and `i32` are refused by dbo-opt (#107) and do not appear at Level D.
+- **1d_compute** (`elementwise__1d_compute[DTYPE=..., OP=...]`) — all 12 cells of
+  `fp16/fp32/i32` × `add/sub/mul/div`. The simplest possible shape (1D, 128
+  elements, single core) so only the arithmetic varies. ktir_cpu only; `div` and
+  `i32` are refused by dbo-opt's scheduler and so do not appear at Level D.
+  The `(i32, div)` cell is the one that pins a **ktir-cpu floor**: an i32 division
+  is not an integer op in Triton — it goes through float — so the kernel carries
+  `arith.sitofp`, `divf` and `fptosi` on *tensors*, and those reach the interpreter
+  un-wrapped now that `convert-elementwise-to-linalg` is in the `spyrecode` stage
+  while the numerical tier reads the `ktir` one. ktir-cpu resolved a cast's result
+  type through a scalar-only path until recently, so a tree predating that fix
+  fails this one cell and nothing else.
 
 ### Level D — device launch (compiles_to_binary)
 

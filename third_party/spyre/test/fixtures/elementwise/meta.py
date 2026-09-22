@@ -713,7 +713,7 @@ VARIANTS = {
     #
     # The op x dtype product on ktir_cpu. Deliberately the simplest shape in
     # the file -- 1D, static, one tile, no layout -- so arithmetic is the only
-    # thing that differs between its entries. LowerSpyreOps (#107) only runs
+    # thing that differs between its entries. LowerSpyreOps only runs
     # at the spyrecode stage (buildSpyrecodePipeline), after ktir_cpu's own
     # module is already built, so this variant's math/arith ops stay in their
     # plain dialect spelling and every combo is reachable end to end.
@@ -733,6 +733,13 @@ VARIANTS = {
         "factory":      Elementwise(rank=1),
         "constexpr":    ["n_elements", "BLOCK_SIZE", "OP"],
         "params": {
+            # The full 3x4 product. (i32, div) is the one cell that exercises a
+            # tensor-typed arith cast: an i32 division is not an integer op in
+            # Triton, so it goes through float and the kernel carries
+            # arith.sitofp / divf / fptosi on tensors. Those reach ktir_cpu
+            # un-wrapped now that ConvertElementwiseToLinalg is in the spyrecode
+            # stage, which is a case ktir-cpu's handlers only gained recently --
+            # so this cell is also the suite's floor on that dependency.
             "DTYPE":      ["fp16", "fp32", "i32"],
             "OP":         ["add", "sub", "mul", "div"],
             "n_elements": [128],
@@ -773,7 +780,16 @@ VARIANTS = {
             "DTYPE": ["fp16"], "OP": ["add"],
         },
         "grid":        [1],
-        "data_layout": "host",
+        # No "data_layout". It selected the NAMED RewriteDescriptorLayout's
+        # "device"/"host" stride mode, and that pass roots on a
+        # tt.spyre_tensor_layout op. tl.spyre_tensor_layout authors
+        # tts.tensor_layout now, so the named pass no-ops on every kernel in this
+        # tree and the option reached nothing. The generic pass that physicalizes
+        # these -- in the spyrecode stage -- has no equivalent option and needs
+        # none: a caller wanting the logical form reads the ktir artifact, which
+        # is logical. Removed rather than left as dead config, because conftest
+        # forwards any key naming a SpyreOptions field and the field still
+        # exists, so it would have kept being passed and kept doing nothing.
         "rtol":        1e-2,
         "atol":        5e-2,
     },
