@@ -39,6 +39,13 @@ def LowerDescriptorMemory : Pass<"lower-descriptor-memory", "mlir::ModuleOp"> {
         - tt.descriptor_gather/scatter → ktdp.construct_indirect_access_tile + ktdp.load/store
         - tt.make_tensor_descriptor — dead after uses are lowered, erased by cleanup
 
+        A layout marker on a descriptor — `tt.spyre_tensor_layout` or
+        `tts.tensor_layout` — is left untouched, along with the
+        builtin.unrealized_conversion_cast bridging the new view's memref back
+        to !tt.tensordesc so the marker's operand keeps verifying. Consuming
+        either is someone else's job: [RewriteDescriptorLayout] for the former,
+        [LowerTTSMarkers] for the latter.
+
         Output: triton ops that this pass doesn't handle (tt.reduce, tt.broadcast,
         tt.expand_dims, tt.func, tt.return, tt.get_program_id) remain unchanged.
         New ktdp, memref, and arith ops are introduced.
@@ -77,7 +84,9 @@ def LowerScalarLoad : Pass<"lower-scalar-load", "mlir::ModuleOp"> {
 
         Output: tensor-of-pointers tt.load, and all other triton ops this
         pass doesn't handle, remain unchanged. New ktdp, arith, and tensor
-        ops are introduced.
+        ops are introduced. A layout marker left standing by
+        [LowerDescriptorMemory] — `tt.spyre_tensor_layout` or
+        `tts.tensor_layout` — passes through here too.
     }];
 
     let dependentDialects = [
@@ -243,10 +252,15 @@ def LowerInterTile : Pass<"lower-inter-tile", "mlir::ModuleOp"> {
         Must run after LowerComputeOps (partials must be linalg/tensor),
         before RewriteDescriptorLayout (that pass has no physical-type
         propagation pattern for tt.inter_tile_reduce, so no inter-tile op may
-        still be live when it runs; a kernel carrying both a
-        tt.spyre_tensor_layout marker and a tt.inter_tile_reduce is rejected
-        here), and before ConvertFunctions (reads function attributes
-        ConvertFunctions would rewrite).
+        still be live when it runs), and before ConvertFunctions (reads function
+        attributes ConvertFunctions would rewrite).
+
+        A kernel that carries both a layout annotation and a
+        tt.inter_tile_reduce is not supported: the layout pass cannot carry a
+        physical type through the produce/reduce pair, whose two halves
+        communicate through a !ktdp.tile_future rather than a RankedTensorType.
+        That combination is not diagnosed — it fails downstream as a type
+        mismatch.
 
         Output: no tt.inter_tile_reduce ops remain; ktdp.inter_tile_produce /
         inter_tile_reduce pairs are introduced; the tile_future is single-use.

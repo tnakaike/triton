@@ -12,6 +12,8 @@
 #include "Conversion/TritonToKTIR/Passes.h"
 #include "ConversionUtils.h"
 #include "Dialect/KTDP/Utils/Utility.h"
+// For `tts::TensorLayoutOp`, which this pass only has to keep legal.
+#include "Dialect/TTS/IR/Dialect.h"
 #include "Utils/Utility.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 #include "ktir/Dialect/KTDP/KTDPAttrs.h"
@@ -644,8 +646,20 @@ struct LowerDescriptorMemoryPass
     //
     // Marking it legal here prevents `applyPartialConversion` from
     // treating either cast as an unconverted op and failing the pass.
+    //
+    // The two layout markers are legal for different reasons, and the
+    // difference is their lifetime rather than anything this pass does:
+    //
+    //   * `tt.spyre_tensor_layout` survives all the way to the named
+    //     `rewrite-descriptor-layout`, which is what consumes it.
+    //   * `tts.tensor_layout` survives only as far as `lower-tts-markers`,
+    //     the next-but-one pass, which moves it onto the memory view built
+    //     here. Either way this pass leaves both untouched; without the
+    //     entry the conversion driver would call the op unconverted and
+    //     fail the pass.
     target.addLegalOp<ModuleOp, UnrealizedConversionCastOp,
-                      triton::SpyreTensorLayoutOp>();
+                      triton::SpyreTensorLayoutOp,
+                      mlir::triton::tts::TensorLayoutOp>();
 
     RewritePatternSet patterns(ctx);
     patterns.add<ConvertDescriptorLoad, ConvertDescriptorStore,
