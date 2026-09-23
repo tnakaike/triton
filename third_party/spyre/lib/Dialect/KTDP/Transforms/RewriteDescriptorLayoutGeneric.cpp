@@ -104,12 +104,14 @@ namespace {
 using namespace mlir;
 using namespace mlir::triton::ktdp;
 
-//===----------------------------------------------------------------------===//
-// Local CoordOp, applyStatic, applyCoordMap
-//===----------------------------------------------------------------------===//
-
-// CoordOp: use Splat (value 3), NOT Broadcast
-enum class CoordOp : int64_t { Identity = 0, FloorDiv = 1, Mod = 2, Splat = 3 };
+// CoordOp, applyStatic and applyCoordMap were local to this file and are now the
+// tts dialect's, beside verifyTensorLayoutArrays -- the checker for the same
+// three arrays. They are the layout contract's, not this pass's: SpyreBackend's
+// footprint capture evaluates the same coordinate map to decide how much device
+// memory a buffer needs, and a second evaluator is a second answer.
+using mlir::triton::tts::applyCoordMap;
+using mlir::triton::tts::applyStatic;
+using mlir::triton::tts::CoordOp;
 
 /// Is `set` the dense range of `shape` — for every dim, the pair of constraints
 /// that bounds it to [0, extent)?
@@ -139,43 +141,6 @@ static bool isDenseRangeSet(IntegerSet set, MLIRContext *ctx,
         simplifyAffineExpr(want.getConstraint(i), want.getNumDims(),
                            want.getNumSymbols()))
       return false;
-  }
-  return true;
-}
-
-// applyStatic: apply one coord op to a static extent
-inline std::optional<int64_t> applyStatic(int64_t logical, CoordOp op,
-                                          int64_t arg) {
-  switch (op) {
-  case CoordOp::Identity:
-    return (logical == mlir::ShapedType::kDynamic)
-               ? std::nullopt
-               : std::optional<int64_t>(logical);
-  case CoordOp::FloorDiv:
-    if (logical == mlir::ShapedType::kDynamic)
-      return std::nullopt;
-    return arg == 0 ? std::optional<int64_t>(std::nullopt)
-                    : std::optional<int64_t>((logical + arg - 1) / arg);
-  case CoordOp::Mod:
-    return arg;
-  case CoordOp::Splat:
-    return arg;
-  }
-  return std::nullopt;
-}
-
-// applyCoordMap: compute physical extents from logical extents
-inline bool applyCoordMap(ArrayRef<int64_t> logSizes, ArrayRef<int64_t> physSrc,
-                          ArrayRef<int64_t> physOp, ArrayRef<int64_t> physArg,
-                          SmallVectorImpl<int64_t> &out) {
-  unsigned physRank = physSrc.size();
-  out.resize(physRank);
-  for (unsigned k = 0; k < physRank; ++k) {
-    auto sz = applyStatic(logSizes[physSrc[k]], static_cast<CoordOp>(physOp[k]),
-                          physArg[k]);
-    if (!sz)
-      return false;
-    out[k] = *sz;
   }
   return true;
 }
@@ -1813,6 +1778,143 @@ struct RewriteDescriptorLayoutGenericPass
     return result;
   }
 
+  /// Will `v` carry a PHYSICAL type once this pass is done?
+  ///
+  /// Exactly two things here give a tensor value a physical type, and this is
+  /// both of them:
+  ///   - rewriteGeneric restates a linalg.generic, so its results follow the
+  ///     rebuilt domain. Every generic that supplies a store over an annotated
+  ///     view is restated: collectAdjacentGenerics reaches it through that store,
+  ///     and findLayoutForResult then finds the store's layout.
+  ///   - physicalizeAccessTile and its indirect twin retype a ktdp.load's result
+  ///     along with the access tile it reads, for every tile over an annotated
+  ///     view.
+  /// Anything else keeps the type it was built with.
+  static bool isOnPhysicalizedChain(Value v,
+                                    const SmallPtrSetImpl<Operation *> &marked) {
+    Operation *def = v.getDefiningOp();
+    if (!def)
+      return false;
+    if (isa<linalg::GenericOp>(def))
+      return true;
+    auto ld = dyn_cast<mlir::ktdp::LoadOp>(def);
+    if (!ld)
+      return false;
+    Operation *tileOp = ld.getAccessTile().getDefiningOp();
+    Value base;
+    if (auto direct =
+            dyn_cast_or_null<mlir::ktdp::ConstructAccessTilesOp>(tileOp))
+      base = direct.getBase();
+    else if (auto indirect =
+                 dyn_cast_or_null<mlir::ktdp::ConstructIndirectAccessTilesOp>(
+                     tileOp))
+      base = indirect.getBase();
+    else
+      return false;
+    Operation *view = base.getDefiningOp();
+    return view && marked.contains(view);
+  }
+
+  /// Before physicalizeDescriptors mutates anything, check that every store over
+  /// an annotated view has a data value something here will physicalize.
+  ///
+  /// Phase 1 redirects a store's access tile to the physical tile
+  /// UNCONDITIONALLY, and nothing in this pass changes a data value's type except
+  /// rewriteGeneric. So a store whose destination alone is annotated, and whose
+  /// data no linalg.generic mediates — a pure load-to-store copy is the shape
+  /// that produces this — ends up with a physical access tile and logical data,
+  /// and ktdp.store's own verifier reports `data tile shape must match access
+  /// tile shape` about an op nobody named.
+  ///
+  /// The named pass absorbs this in a widening stage (ContractionSynthesis.cpp,
+  /// "widen one op-tile into physical (a store's data)"). This pass has none by
+  /// choice: every case where a compute op sits between the load and the store is
+  /// already handled by the rebuild giving both ends the same domain (see
+  /// rebuild-composite.mlir case 3), and the remaining case is a copy, for which
+  /// annotating the source as well costs one marker and needs no new machinery.
+  ///
+  /// Only this direction is checked. The mirror image — a physicalized data value
+  /// stored through an unannotated, still-logical access tile — is also
+  /// reachable, but deciding it needs this pass to predict whether a given
+  /// generic will be rewritten at all, and over-reporting there would decline
+  /// programs that lower correctly today. It still reaches the verifier.
+  LogicalResult checkStoreDataIsRestatable(
+      ArrayRef<mlir::ktdp::ConstructMemoryViewOp> annotatedViews) {
+    SmallPtrSet<Operation *, 8> marked;
+    for (auto view : annotatedViews)
+      marked.insert(view.getOperation());
+
+    LogicalResult result = success();
+    for (auto view : annotatedViews)
+      for (Operation *tile : view.getResult().getUsers()) {
+        if (!isa<mlir::ktdp::ConstructAccessTilesOp,
+                 mlir::ktdp::ConstructIndirectAccessTilesOp>(tile))
+          continue;
+        for (Operation *user : tile->getResult(0).getUsers()) {
+          auto st = dyn_cast<mlir::ktdp::StoreOp>(user);
+          if (!st || isOnPhysicalizedChain(st.getDataTile(), marked))
+            continue;
+          st.emitError(
+              "rewrite-descriptor-layout-generic: this store's access tile is "
+              "physicalized but its data is not on a physicalized chain, and "
+              "this pass restates only linalg.generic; a one-sided annotation "
+              "has no vehicle for the shape change, so annotate the source "
+              "descriptor too, at a layout compatible with this one");
+          result = failure();
+        }
+      }
+    return result;
+  }
+
+  /// After everything: no annotated view may survive.
+  ///
+  /// The pass's post-condition, and the thing that makes a claim about a
+  /// descriptor's device footprint safe to record before the pass runs.
+  /// `SpyreBackend` writes each annotated descriptor's physical extents into
+  /// `metadata["device_layouts"]` in the `ktir` stage, from the author's
+  /// *request*; a launcher then refuses a tensor too small for it. That is only
+  /// sound if a request this pass does not honour fails the compile instead of
+  /// reaching an artifact, because an unhonoured request is a claim about memory
+  /// the kernel never addresses — a false alarm in the best case and, if the
+  /// numbers happen to line up the other way, a check that passes while the
+  /// kernel overruns.
+  ///
+  /// Every *decline* already fails: readLayout, readCoordMap, physicalizeMemView
+  /// and both access-tile paths return failure, and the two checks above return
+  /// it before anything is touched. What this catches is the other way an
+  /// annotation goes unhonoured — not declined, just not reached. The logical view
+  /// is only erased when it has no users left, so a view with a user this pass
+  /// does not walk (it walks access tiles and nothing else) stays behind with its
+  /// attribute intact and no diagnostic. That is a silent logical artifact from a
+  /// kernel that asked to be physicalized.
+  ///
+  /// Phrased as "no attribute survives" rather than as an equality against the
+  /// recorded extents, and that is the one thing worth saying about where this
+  /// check lives. An equality is not available here and would not be worth having
+  /// if it were: this pass derives its physical sizes from `tts::applyCoordMap`
+  /// over the view's logical memref, and the metadata capture derives its from
+  /// the same function over the same extents (`getDescriptorLogicalLayout`, shared
+  /// with LowerDescriptorMemory, is what makes them the same extents). Comparing
+  /// the two would be comparing one function with itself. What can differ is
+  /// whether the pass ran on a view at all, which is exactly this.
+  LogicalResult checkEveryAnnotationHonoured(ModuleOp module) {
+    LogicalResult result = success();
+    module.walk([&](mlir::ktdp::ConstructMemoryViewOp op) {
+      if (!op->hasAttr(triton::tts::TTSDialect::kTensorLayoutAttrName))
+        return;
+      op.emitError(
+          "rewrite-descriptor-layout-generic: this memory view still carries a "
+          "tts.tensor_layout after physicalization, so the layout it asks for "
+          "was never applied. The logical view is erased only once nothing uses "
+          "it, and this pass redirects access-tile users only -- so some other "
+          "user is holding it. The compiled metadata records this layout as the "
+          "buffer's device footprint, which would then describe memory the "
+          "kernel does not address");
+      result = failure();
+    });
+    return result;
+  }
+
   /// The generics adjacent to a physicalized view: for each view
   /// physicalizeDescriptors recorded, every generic that reads one of its loads
   /// or supplies one of its stores. Listed once each, in the order the views
@@ -1882,7 +1984,14 @@ struct RewriteDescriptorLayoutGenericPass
     LLVM_DEBUG(llvm::dbgs() << "[rewrite-descriptor-layout-generic] "
                             << annotatedViews.size() << " annotated view(s)\n");
 
-    if (failed(checkConsumersAreRewritable(annotatedViews)))
+    // Both checks run before Phase 1 touches anything, and for the same reason:
+    // retyping first leaves a mismatch that MLIR's own verifier reports against
+    // an indexing map or a store, naming neither this pass nor what it could not
+    // restate. Both are run before either can fail, so one invocation reports
+    // every problem it can see.
+    bool checksFailed = failed(checkConsumersAreRewritable(annotatedViews));
+    checksFailed |= failed(checkStoreDataIsRestatable(annotatedViews));
+    if (checksFailed)
       return signalPassFailure();
 
     if (failed(physicalizeDescriptors(annotatedViews)))
@@ -1893,6 +2002,11 @@ struct RewriteDescriptorLayoutGenericPass
     for (auto memViewOp : deadLogicalMemViews)
       if (memViewOp->getBlock() && memViewOp.use_empty())
         memViewOp.erase();
+
+    // Last, and after the sweep above: a view is only erased once it has no users
+    // left, so what survives is what this pass could not finish with.
+    if (failed(checkEveryAnnotationHonoured(module)))
+      return signalPassFailure();
   }
 };
 

@@ -29,6 +29,134 @@ void TTSDialect::initialize() {
       >();
 }
 
+std::optional<CoordOp> symbolizeCoordOp(int64_t code) {
+  switch (static_cast<CoordOp>(code)) {
+  case CoordOp::Identity:
+  case CoordOp::FloorDiv:
+  case CoordOp::Mod:
+  case CoordOp::Splat:
+    return static_cast<CoordOp>(code);
+  }
+  return std::nullopt;
+}
+
+std::optional<int64_t> applyStatic(int64_t logical, CoordOp op, int64_t arg) {
+  switch (op) {
+  case CoordOp::Identity:
+    return (logical == ShapedType::kDynamic) ? std::nullopt
+                                             : std::optional<int64_t>(logical);
+  case CoordOp::FloorDiv:
+    if (logical == ShapedType::kDynamic)
+      return std::nullopt;
+    // Ceiling, not floor -- see the header. arg == 0 is refused rather than
+    // divided by; verifyTensorLayoutArrays already requires arg > 0 here, so
+    // this only catches a caller that skipped it.
+    return arg == 0 ? std::nullopt
+                    : std::optional<int64_t>((logical + arg - 1) / arg);
+  case CoordOp::Mod:
+  case CoordOp::Splat:
+    // Neither reads `logical`: both give exactly `arg` extents.
+    return arg;
+  }
+  return std::nullopt;
+}
+
+bool applyCoordMap(ArrayRef<int64_t> logSizes, ArrayRef<int64_t> physSrc,
+                   ArrayRef<int64_t> physOp, ArrayRef<int64_t> physArg,
+                   SmallVectorImpl<int64_t> &out) {
+  out.resize(physSrc.size());
+  for (unsigned k = 0, e = physSrc.size(); k < e; ++k) {
+    auto sz = applyStatic(logSizes[physSrc[k]], static_cast<CoordOp>(physOp[k]),
+                          physArg[k]);
+    if (!sz)
+      return false;
+    out[k] = *sz;
+  }
+  return true;
+}
+
+bool evaluateDeviceLayout(ArrayRef<int64_t> logSizes,
+                          ArrayRef<int64_t> logStrides,
+                          ArrayRef<int64_t> physSrc, ArrayRef<int64_t> physOp,
+                          ArrayRef<int64_t> physArg,
+                          SmallVectorImpl<int64_t> &deviceSize,
+                          SmallVectorImpl<int64_t> &strideMap) {
+  // The two logical arrays are indexed by the same physSrc[k] below.
+  // getDescriptorLogicalLayout always produces them parallel; a caller reading a
+  // shape and a stride list from different places may not.
+  if (logSizes.size() != logStrides.size())
+    return false;
+
+  SmallVector<int64_t> extents;
+  if (!applyCoordMap(logSizes, physSrc, physOp, physArg, extents))
+    return false;
+  unsigned rank = extents.size();
+
+  // How far does one step along each device axis move the host pointer? Innermost
+  // to outermost, so that an outer half of a partitioned dim can multiply up by
+  // whatever the inner half turned out to be: `running[d]` is the stride the next
+  // axis over logical dim d will take, seeded with the dim's own host stride.
+  SmallVector<int64_t> strides(rank, 0);
+  SmallVector<int64_t> running(logStrides.begin(), logStrides.end());
+  for (int k = (int)rank - 1; k >= 0; --k) {
+    int64_t d = physSrc[k];
+    if (static_cast<CoordOp>(physOp[k]) == CoordOp::Splat || logSizes[d] == 1) {
+      strides[k] = -1;
+      continue;
+    }
+    strides[k] = running[d];
+    // A dynamic logical stride stays dynamic rather than being multiplied: the
+    // product would overflow. Unreachable for anything in tree -- a dynamic dim
+    // only survives applyCoordMap under mod or splat -- and the alternative is
+    // signed-overflow UB rather than a number.
+    running[d] = strides[k] == ShapedType::kDynamic
+                     ? ShapedType::kDynamic
+                     : strides[k] * extents[k];
+  }
+
+  deviceSize.assign(extents.begin(), extents.end());
+  strideMap.assign(strides.begin(), strides.end());
+
+  // torch-spyre's DMA reads the axis THIRD FROM THE END as the tile-count half of
+  // the stick split, and overwrites what it matched there. If ours is something
+  // else, that read corrupts a real dimension -- so put a harmless unit axis where
+  // it looks. Three shapes are harmless already; see the header for what each
+  // rests on.
+  if (rank < 2)
+    return true;
+  unsigned p = rank > 2 ? rank - 3 : 0;
+  unsigned last = rank - 1;
+  bool harmless =
+      strides[p] == -1 || extents[p] == 1 ||
+      (physSrc[p] == physSrc[last] &&
+       static_cast<CoordOp>(physOp[p]) == CoordOp::FloorDiv &&
+       static_cast<CoordOp>(physOp[last]) == CoordOp::Mod);
+  if (harmless)
+    return true;
+
+  // Second from the end, so that after the insertion shifts everything later the
+  // unit axis is the one third from the end -- where the DMA will look. Inserting
+  // at `p` instead would leave that read pointing at a real axis.
+  //
+  // UNTESTED for rank >= 4, and this is the line to test first when a rank-4
+  // layout reaches the device, because nothing in tree can tell the two positions
+  // apart: they COINCIDE at rank 2 -- the splat case, the only one verified on
+  // hardware -- and of the 8 insertions this performs across the fixtures, the 7
+  // where they differ are all rank >= 4 (`matmul__bmm_*`,
+  // `reduce__middle_axis_spyre_stick`), none of which declares
+  // `compiles_to_binary`, so no tier reaches them. Confirmed by mutation:
+  // `at = p` leaves both suites green.
+  //
+  // The failure mode is silent, which is why it needs a test rather than a
+  // comment: a wrong position leaves the DMA's read on a real axis, `dcsi_sizes`
+  // stays all ones and one element moves instead of the full extent, with no check
+  // firing.
+  unsigned at = rank - 2;
+  deviceSize.insert(deviceSize.begin() + at, 1);
+  strideMap.insert(strideMap.begin() + at, -1);
+  return true;
+}
+
 LogicalResult verifyTensorLayoutArrays(
     ArrayRef<int64_t> src, ArrayRef<int64_t> op, ArrayRef<int64_t> arg,
     unsigned logicalRank,
@@ -62,30 +190,42 @@ LogicalResult verifyTensorLayoutArrays(
 
     // phys_op[k] is static_cast to a CoordOp enum and switched on without a
     // default; an unknown code leaves the derived coordinate expression unset.
-    if (op[k] < 0 || op[k] > 3)
+    // Through symbolizeCoordOp, and the codes in the message through the enum,
+    // so that the numbering is stated once -- in CoordOp -- rather than spelled
+    // as literals a few lines from the enum that owns it.
+    std::optional<CoordOp> coordOp = symbolizeCoordOp(op[k]);
+    if (!coordOp)
       return emitError()
-             << "tts.tensor_layout: phys_op[" << k
-             << "] must be 0 (identity), 1 (floordiv), 2 (mod) or 3 (splat), "
-                "got "
+             << "tts.tensor_layout: phys_op[" << k << "] must be "
+             << static_cast<int64_t>(CoordOp::Identity) << " (identity), "
+             << static_cast<int64_t>(CoordOp::FloorDiv) << " (floordiv), "
+             << static_cast<int64_t>(CoordOp::Mod) << " (mod) or "
+             << static_cast<int64_t>(CoordOp::Splat) << " (splat), got "
              << op[k];
 
     // phys_arg is the floordiv divisor / mod modulus / splat lane count; 0
     // divides by zero when deriving physical extents and yields a zero-width
     // stick or a zero-lane splat.
-    if (op[k] != 0 && arg[k] <= 0)
+    if (*coordOp != CoordOp::Identity && arg[k] <= 0)
       return emitError() << "tts.tensor_layout: phys_arg[" << k
                          << "] must be > 0 for a floordiv/mod/splat dim, got "
                          << arg[k];
 
     ++numTotal[src[k]];
-    if (op[k] == 0)
+    switch (*coordOp) {
+    case CoordOp::Identity:
       ++numIdentity[src[k]];
-    else if (op[k] == 1)
+      break;
+    case CoordOp::FloorDiv:
       ++numFloorDiv[src[k]];
-    else if (op[k] == 2)
+      break;
+    case CoordOp::Mod:
       ++numMod[src[k]];
-    else
+      break;
+    case CoordOp::Splat:
       ++numSplat[src[k]];
+      break;
+    }
   }
 
   // A logical dim may legitimately span two physical dims in two ways:

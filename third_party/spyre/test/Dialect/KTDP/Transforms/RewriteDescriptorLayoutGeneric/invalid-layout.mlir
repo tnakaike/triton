@@ -9,7 +9,7 @@
 // diagnostic has to come from the pass, and each has to name the pass or the op
 // rather than surfacing later as a verifier failure about an indexing map.
 //
-// These three are reachable through the shapes the backend's own lowering
+// Every case here is reachable through the shapes the backend's own lowering
 // produces. Diagnostics about a layout the pass cannot consume at all, or a
 // malformed KTIR chain beneath one it can, live in invalid-ktir.mlir; the
 // structural rules the verifier owns are in
@@ -139,6 +139,76 @@ tt.func @named_matmul_declines(%a: !tt.ptr<f16>, %b: !tt.ptr<f16>, %c: !tt.ptr<f
 
   %st = ktdp.construct_access_tile %cv[%c0, %c0] {access_tile_order = #id, access_tile_set = #sa} : memref<128x64xf16> -> !ktdp.access_tile<128x64xindex>
   ktdp.store %d, %st : tensor<128x64xf16>, <128x64xindex>
+  tt.return
+}
+}
+
+// -----
+
+// Case 4 -- only the destination is annotated, and nothing mediates the data.
+//
+// A pure load-to-store copy, so there is no linalg.generic anywhere -- and
+// rewriteGeneric is the only thing in this pass that changes a data value's type.
+// Phase 1 redirects the store's access tile to the physical tile regardless, so the
+// store would end up with a rank-3 access tile and its rank-2 loaded data, and
+// ktdp.store's own verifier would report `data tile shape must match access tile
+// shape` about an op nobody named.
+//
+// The named pass absorbs this in a widening stage; this one declines instead, and
+// the remedy is one more marker. rebuild-composite.mlir case 3 is the same store
+// with a generic in between, which needs no widening because the rebuild gives both
+// ends the same domain -- that contrast is why the decline is narrow.
+
+#idc = affine_map<(d0, d1) -> (d0, d1)>
+#sc = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+module {
+tt.func @store_only_annotated_copy(%a: !tt.ptr<f32>, %o: !tt.ptr<f32>) {
+  %c0 = arith.constant 0 : index
+  // The source carries no layout, so its load stays rank 2.
+  %ai = builtin.unrealized_conversion_cast %a : !tt.ptr<f32> to index
+  %av = ktdp.construct_memory_view %ai, sizes: [64, 128], strides: [128, 1] {coordinate_set = #sc, memory_space = #ktdp.memory_space<global>} : memref<64x128xf32>
+  %at = ktdp.construct_access_tile %av[%c0, %c0] {access_tile_order = #idc, access_tile_set = #sc} : memref<64x128xf32> -> !ktdp.access_tile<64x128xindex>
+  %al = ktdp.load %at : <64x128xindex> -> tensor<64x128xf32>
+
+  %oi = builtin.unrealized_conversion_cast %o : !tt.ptr<f32> to index
+  %ov = ktdp.construct_memory_view %oi, sizes: [64, 128], strides: [128, 1] {coordinate_set = #sc, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<64x128xf32>
+  %ot = ktdp.construct_access_tile %ov[%c0, %c0] {access_tile_order = #idc, access_tile_set = #sc} : memref<64x128xf32> -> !ktdp.access_tile<64x128xindex>
+  // expected-error @below {{rewrite-descriptor-layout-generic: this store's access tile is physicalized but its data is not on a physicalized chain, and this pass restates only linalg.generic; a one-sided annotation has no vehicle for the shape change, so annotate the source descriptor too, at a layout compatible with this one}}
+  ktdp.store %al, %ot : tensor<64x128xf32>, <64x128xindex>
+  tt.return
+}
+}
+
+// -----
+
+// Case 5 -- an annotated view this pass never reaches.
+//
+// The post-condition, and the thing that makes SpyreBackend's device-footprint
+// claim safe. Every DECLINE above fails the compile; this is the other way an
+// annotation goes unhonoured -- not declined, just not walked. The pass redirects
+// access-tile users and nothing else, and it erases the logical view only once
+// nothing uses it, so a view held by any other user survives with its layout
+// intact.
+//
+// A bridge cast back to !tt.tensordesc is that other user here: no access
+// tile, so physicalizeDescriptor finds nothing to redirect and the view stays live.
+// On the real pipeline LowerTTSMarkers erases that cast along with the marker it
+// existed for, so reaching this state means a descriptor nothing reads or writes --
+// which is exactly the case a footprint claim must not be made for. Without the
+// check this lowers cleanly to a LOGICAL artifact while
+// metadata["device_layouts"] reports the physical footprint the kernel asked for --
+// a claim about memory the kernel never addresses, which a launcher would then
+// bounds-check against.
+
+#sd = affine_set<(d0) : (d0 >= 0, -d0 + 127 >= 0)>
+module {
+tt.func @annotation_never_reached(%o: !tt.ptr<f16>) {
+  %oi = builtin.unrealized_conversion_cast %o : !tt.ptr<f16> to index
+  // expected-error @below {{rewrite-descriptor-layout-generic: this memory view still carries a tts.tensor_layout after physicalization}}
+  %ov = ktdp.construct_memory_view %oi, sizes: [128], strides: [1] {coordinate_set = #sd, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 0, 0>, phys_op = array<i64: 1, 2>, phys_arg = array<i64: 64, 64>}} : memref<128xf16>
+  %od = builtin.unrealized_conversion_cast %ov : memref<128xf16> to !tt.tensordesc<128xf16>
   tt.return
 }
 }
