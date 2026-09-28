@@ -19,53 +19,85 @@ KTIR spelling is the same in both, deliberately.
 
 ## What one file contains
 
-The three phases of the design's §3, for **one executing tile** -- the tile holding
-the first destination piece, because the offsets a tile passes when it reads are
-what the destination arrangement consists of.
+The whole movement, as two distributions and a copy between them:
 
-| Phase | Ops |
+| | |
 |---|---|
-| 1, build the source view | one `ktdp.construct_memory_view` per source partition, composed by `ktdp.construct_distributed_memory_view` |
-| 2, place the access | `ktdp.construct_access_tile` on the composed view, anchored at this tile's destination offsets |
-| 3, transfer and land | `ktdp.load`, then `ktdp.store` into a plain `ct_local` view |
+| the source distribution | one `ktdp.construct_memory_view` per source piece, composed by `ktdp.construct_distributed_memory_view` |
+| the destination distribution | the same, one view per destination *(piece, owner)* pair, composed the same way |
+| the movement | one `ktdp.construct_access_tile` + `ktdp.load` on the source, one tile + `ktdp.store` on the destination, whole-tensor on both sides |
+
+**Both sides are composed, and that is the point.** An earlier revision wrote
+each example from one tile's point of view: the source composed, the destination
+a plain `ct_local` landing with no `ct_id`. That form cannot state its own
+movement. C001 lands the whole tensor on all 32 cores, and in the one-tile form
+the only "32" in the file was a comment -- the breadth lived in the launch, so
+the IR was equally consistent with one core or all of them.
+
+Composing the destination puts it back in the IR. A piece with several owners is
+that many views with the **same** `coordinate_set` and different `ct_id`, which is
+exactly what replication is. Nothing in the dialect objects: the verifier checks
+element type and rank, and the op's own documentation leaves overlapping
+coordinate sets "unspecified unless ... constrained by ... program semantics" --
+a broadcast is such a semantics, since every holder receives the same bytes.
+
+It also stops the examples from taking a side on transport. With both
+distributions named, *which* side does the transferring is a lowering's choice:
+pull, where each destination holder reads its share, or push. The one-tile form
+had pull baked into its shape.
+
+This is a deliberate divergence from
+[inter-tile-lowering-to-mem-view.md](../inter-tile-lowering-to-mem-view.md) §4,
+which composes only the source and calls a destination view "meaningless where
+destinations are replicated", on the grounds that it would have "two writers for
+one coordinate with nothing saying which wins". That argument holds for two
+*different* values racing; it does not hold for a broadcast, where the writers
+agree. §4's other objection -- that remote writes are unverified where remote
+reads are supported -- is about lowering, and survives.
 
 ## How the SDSC becomes KTIR
 
 | Source record | KTIR |
 |---|---|
-| a source piece's `start` and `size` | the `coordinate_set`, as the box `[start, start + size)` in the tensor's global index space |
-| that piece's `owners[0]` | `memory_space = #ktdp.memory_space<ct_local, ct_id = N>`, repeated in the result memref type |
-| the union of the source pieces | the composed view's result shape, which equals `source_extents` for all 35 |
-| the destination piece's `start` | the access tile's anchor indices |
-| the destination piece's `size` | the access tile's shape, and the landed buffer's |
+| a piece's `start` and `size` | the `coordinate_set`, as the box `[start, start + size)` in the tensor's global index space |
+| each of that piece's `owners` | one view per owner, `memory_space = #ktdp.memory_space<ct_local, ct_id = N>`, repeated in the result memref type |
+| the union of a side's pieces | that side's composed result shape |
 | `word_length` | the element type: 2 bytes, so `f16` throughout |
 
-Three conventions, none of which the source record dictates:
+Source and destination extents are identical in all 35, and each side's boxes
+union to exactly those extents, so both composed views have the same type and the
+copy between them needs no reshaping.
 
-**One `%off` serves every source partition.** The design requires the partition
-views to differ *only* in `coordinate_set` and `ct_id` -- offsets, sizes and strides
-are identical across them -- which means one address, at the same place in each
-core's scratchpad. The capture carries no LX addresses, so `%off` and the landing's
-`%land` are `index` arguments rather than invented constants.
+Two conventions the source record does not dictate:
 
-**The examples stop at the landing store.** The consumer op is not emitted; the
-relayout is the subject. The `consumer` column below says what would have read it.
+**One `%src` and one `%dst`.** The design requires the views on a side to differ
+*only* in `coordinate_set` and `ct_id`, which means one address, at the same place
+in each core's scratchpad. The capture carries no LX addresses, so these are
+`index` arguments rather than invented constants.
 
 **`access_tile_set` is a range over the block shape**, not the box in global
 coordinates, because that is what `buildAccessTile` emits
-(`lib/Dialect/KTDP/Utils/Utility.cpp`). An example should look like what the
-lowering would produce.
+(`lib/Dialect/KTDP/Utils/Utility.cpp`).
 
 ## What the set does and does not cover
 
-Every **source** piece in all 35 has exactly one owner, so the design's §5 case of a
-region held by several tiles does not appear here. **Destination** pieces do
-replicate, and heavily: C011's single destination piece is owned by all 32 cores, so
-every core runs the identical read. Under the pull model that replication needs no
-expression of its own, which is why those files look like any other.
-
 Ranks run 3 to 6. Fan-in runs from 1 source piece (C020, a broadcast, where the
-compose has a single partition) to 32.
+source compose has a single partition) to 32.
+
+**Core ids are never arbitrary.** Across all 130 relayouts in the package -- not
+just these 35 -- every owner set is either a single core or an exact arithmetic
+progression: 3109 single, 542 contiguous, and 195 strided by 2, 4, 8 or 16. Zero
+irregular sets out of 3846 checked. Non-contiguous is common (C013's destinations
+are `0, 4, 8, ...`; C014's sources are just `0, 16`), but a stride and an offset
+always describe one. That is what a grid coordinate projects to -- 32 cores as 8
+groups of 4 gives each group `{g, g+8, g+16, g+24}` -- so a holder is derivable
+from a work-slice coordinate rather than needing an arbitrary table. The format
+could express an irregular set, so a verifier should not *rely* on this; what the
+evidence supports is that a coordinate is sufficient for real workloads.
+
+Every **source** piece has exactly one owner, so a region held by several tiles on
+the *source* side does not appear here at all. Destination replication is
+everywhere, up to all 32 cores holding the whole tensor.
 
 ## The 35
 
