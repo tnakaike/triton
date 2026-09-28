@@ -260,6 +260,13 @@ slice width           512 / 8 = 64 on out; x is whole
 => partition 3 owns   out[192:256] by x[0:64], held by the tile at {"out": 3}
 ```
 
+That example is invented, for readability. The three phases written out over the
+relayouts a real model actually performs — 35 of them, at their recorded extents and
+owner maps — are in
+[inter-tile-examples/](inter-tile-examples/README.md). Where this section and that
+corpus disagree about a spelling, the corpus is the one that has been through a
+verifier.
+
 ### Where the phases live
 
 `LowerInterTile` gains a second mode. The existing path — `tt.inter_tile_reduce` to
