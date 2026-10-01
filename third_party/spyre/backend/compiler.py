@@ -52,6 +52,42 @@ INIT_BINARY = "init_binary.bin"
 #: anyway, because it is part of the layout and the tests assert it is carried.
 DEBUG_DIR = "debug"
 
+# ---------------------------------------------------------------------------
+# The two KTIR artifacts, and why there are two
+#
+# KTIR lowering is TWO pass pipelines, not one, and each ends in KTIR:
+#
+#   stage `ktir`      buildTTIRToKTIRPipeline   TTIR  -> KTIR, LOGICAL
+#   stage `spyrecode` buildSpyrecodePipeline    KTIR  -> KTIR, PHYSICAL, then dbo-opt
+#
+# Both lists are in third_party/spyre/lib/Pipeline.cpp and the admission rule for
+# which stage a pass belongs to is in Pipeline.h. The first artifact is the one a
+# KTIR reader (ktir-cpu, the numerical tier) consumes: descriptors are at the shape
+# and strides the kernel declared, with the device layout riding along as a
+# `tts.tensor_layout` attribute. The second is stick-tiled, has its pins
+# materialized and its linalg generalized, and is standalone KTIR no longer -- it
+# exists for dbo-opt.
+#
+# Only the second used to be written to disk here, which made the split invisible
+# at exactly the point where the difference is largest: on the one example with a
+# pin and a composed descriptor, the pair differs by `tts.pin` 2 -> 0,
+# `linalg.matmul` 1 -> 0 and `linalg.generic` 0 -> 3. Both are written now, so the
+# two can be diffed.
+#
+# Which of them reaches the ARTIFACT is not symmetric, and deliberately. dbo-opt's
+# own debug tree already holds the module it was handed -- that is the second one,
+# and spyrecode-compile-test.py's
+# test_the_archive_carries_the_module_dbo_opt_was_handed is the assertion and the
+# argument for not duplicating it. The logical form has no such record anywhere: it
+# exists only inside this process, between the two pipelines, and dbo-opt never sees
+# it. So that one goes into the artifact and the device one stays local.
+#
+#: The `ktir` stage's output as this stage received it: logical, pre-physicalization.
+LOGICAL_KTIR_FILE = "kernel.logical.ktir"
+
+#: What dbo-opt is actually handed: the `spyrecode` pipeline's output.
+DEVICE_KTIR_FILE = "kernel.ktir"
+
 #: The compile stage, its artifact's file extension, and the value recorded in
 #: metadata["stage"] -- one name in three roles, and they have to agree:
 #: ``binary_ext`` is how CompiledKernel picks which cached file to read as the
@@ -667,6 +703,12 @@ class SpyreBackend(BaseBackend):
         whether to bind the base addresses, and which. That is where
         ``options.symbolic_args`` is honoured — the one place in the backend that
         branches on the mode.
+
+        BOTH sides of that round trip are written next to each other, as
+        LOGICAL_KTIR_FILE and DEVICE_KTIR_FILE: this method is the only one that ever
+        holds both forms, so a reader comparing them is reading the stage boundary
+        itself. Only the logical one is also carried in the artifact, for the reason
+        in the note beside those two names.
         """
         from triton._C.libtriton import ir, spyre
 
@@ -686,6 +728,12 @@ class SpyreBackend(BaseBackend):
                     "SpyreOptions.base_addresses explicitly."
                 )
 
+        # The `ktir` stage's artifact, as this stage received it. Captured here and
+        # not later because the pass manager rewrites `mod` IN PLACE: once
+        # add_spyrecode_pipeline has run, the logical form is gone from the process,
+        # and this method is the only one that ever held both.
+        logical_ktir = str(mod)
+
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()  # MLIR_ENABLE_DUMP
         spyre.passes.ttir_to_ktdp.add_spyrecode_pipeline(
@@ -694,6 +742,7 @@ class SpyreBackend(BaseBackend):
             base_addresses=list(base_addresses),
         )
         pm.run(mod, "make_spyrecode")
+        device_ktir = str(mod)
 
         dbo_opt = resolve_dbo_opt()
         device = resolve_device()
@@ -705,8 +754,13 @@ class SpyreBackend(BaseBackend):
             prefix="spyrecode_", delete=not knobs.spyre.dbo_debug,
         ) as _tmp_str:
             tmp = Path(_tmp_str)
-            ktir_path = tmp / "kernel.ktir"
-            ktir_path.write_text(str(mod))
+            ktir_path = tmp / DEVICE_KTIR_FILE
+            ktir_path.write_text(device_ktir)
+            # The stage's input beside its output. One extra file, and it is what
+            # makes the ktir/spyrecode boundary readable rather than inferable:
+            # diffing the two shows exactly what physicalization, pin
+            # materialization and linalg generalization did.
+            (tmp / LOGICAL_KTIR_FILE).write_text(logical_ktir)
             export_dir = tmp / "export"
             export_dir.mkdir()
 
@@ -754,6 +808,21 @@ class SpyreBackend(BaseBackend):
                     f"dbo-opt exited 0 but did not write {', '.join(missing)} "
                     f"under {code_dir}\n  argv: {' '.join(argv)}\n{result.stderr}"
                 )
+
+            # The LOGICAL form into the artifact's debug tree, beside dbo-opt's own
+            # dump of the device form, so an unpacked kernel carries both halves of
+            # the stage boundary rather than only the half dbo-opt saw. The device
+            # form is not copied here: see the note beside the two file names.
+            #
+            # AFTER dbo-opt, not before: that tree is dbo-opt's while it runs, and a
+            # file placed there first is one it is entitled to clear. Gated on the
+            # same knob, so one setting decides whether a KTIR record survives at
+            # all -- without it the temporary directory is deleted on the way out and
+            # the copies in it go with it.
+            if knobs.spyre.dbo_debug:
+                debug_dir = export_dir / DEBUG_DIR
+                debug_dir.mkdir(exist_ok=True)
+                (debug_dir / LOGICAL_KTIR_FILE).write_text(logical_ktir)
 
             # Relative to export_dir, not to code_dir: the archive keeps the
             # layout as exported, spyreCodeDir/ and debug/ side by side, because
