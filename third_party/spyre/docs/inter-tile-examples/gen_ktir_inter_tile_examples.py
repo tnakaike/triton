@@ -148,6 +148,81 @@ def dest_derivation(rec, keys, cores):
     return out
 
 
+def dest_geometry(rec, keys):
+    """The destination side, as the composed view has to describe it.
+
+    Returns `(pieces, piece, lo, union, R, stride)`: the piece shape every
+    destination piece shares, the origin and extent of the box they tile, the
+    number of owners each piece has, and the stride of one piece's owner set.
+
+    `union` is NOT always the tensor's extents -- C035's pieces all sit at
+    `mb = 511`, so the box they tile is one row of 512 -- and the pieces tile it
+    exactly, which is what makes a composed shape well defined.
+    """
+    dps = rec["destination_pieces"]
+    piece = [dps[0]["size"][k] for k in keys]
+    assert all([p["size"][k] for k in keys] == piece for p in dps), rec["relayout"]
+    R = len(dps[0]["owners"])
+    assert all(len(p["owners"]) == R for p in dps), rec["relayout"]
+    lo = [min(p["start"][k] for p in dps) for k in keys]
+    hi = [max(p["start"][k] + p["size"][k] for p in dps) for k in keys]
+    union = [hi[i] - lo[i] for i in range(len(keys))]
+    vol = lambda v: functools.reduce(operator.mul, v, 1)
+    assert vol(piece) * len(dps) == vol(union), rec["relayout"]
+    strides = set()
+    for p in dps:
+        o = sorted(p["owners"])
+        strides |= {o[i + 1] - o[i] for i in range(len(o) - 1)} or {1}
+    assert len(strides) == 1, (rec["relayout"], strides)
+    return dps, piece, lo, union, R, strides.pop()
+
+
+def replica_index(dps, cores, R, stride):
+    """`None` where nothing is replicated, else `(a, b)` with
+
+        replica = (tid // a) % b
+
+    the position of a core in its piece's owner list -- which is WHICH of the
+    `R` slots the composed destination holds for that piece this core writes.
+
+    `a` is the owner set's own stride and `b` is `R`, so the form is read off the
+    geometry rather than searched for; it is still checked per core, and `b` is
+    not required to be a power of two (C003 has 25 owners, C004 28).
+    """
+    if R == 1:
+        return None
+    rep = {o: i for p in dps for i, o in enumerate(sorted(p["owners"]))}
+    assert all(rep[c] == (c // stride) % R for c in cores), rep
+    return stride, R
+
+
+def emit_base(A, keys, deriv):
+    """Emit the index arithmetic for a core's box, and return one base per dim.
+
+    Shared by both spellings, which derive the same box: `dist-store` uses it for
+    the read out of the composed source and, shifted, for the write into the
+    composed destination; `if-store` for the read alone, its landing being local.
+    """
+    base = []
+    for k in keys:
+        v = deriv[k]
+        if v[0] == "const":
+            base.append(f"%c{v[1]}")
+            continue
+        _, a, b, extent = v
+        q = "%tid"
+        if a != 1:
+            A(f"  %q_{k} = arith.divsi %tid, %c{a} : index")
+            q = f"%q_{k}"
+        A(f"  %i_{k} = arith.remsi {q}, %c{b} : index")
+        if extent == 1:
+            base.append(f"%i_{k}")
+        else:
+            A(f"  %o_{k} = arith.muli %i_{k}, %c{extent} : index")
+            base.append(f"%o_{k}")
+    return base
+
+
 def participation(rec, grid):
     """`None` when every core participates, else a guard on the tile id.
 
@@ -176,9 +251,28 @@ def emit_dist(row, rec):
     """One curated record -> one self-contained KTIR example.
 
     BOTH sides are composed. The source pieces become one distributed view and the
-    destination pieces become another, so the function is the whole movement rather
-    than one tile's share of it -- see the README on what that buys and what it
-    leaves to a lowering.
+    destination (piece, owner) pairs become another, so the function is the whole
+    movement rather than one tile's share of it -- see the README on what that buys
+    and what it leaves to a lowering.
+
+    **The composed destination is the WHOLE of what its views hold**, not the box
+    they cover: `R` owners of one piece are `R` slots, so the result shape is the
+    union of the pieces with dimension 0 multiplied by `R`. C002's destination is
+    the whole 4096-element tensor held by 16 cores, so its composed type is
+    `memref<65536x1x1xf16>`.
+
+    That is what puts the tile id in this spelling: with one slot per (piece,
+    owner) there is no coordinate two cores write, and so a store has to say WHICH
+    slot -- the piece from the same fields of the tile id `if-store` uses, and the
+    replica from one more.
+
+    **Participation is not stated, because it follows.** The slot a core addresses
+    carries its holder's `ct_id`, so a core that addresses a slot it does not own
+    is asking for a remote write; nothing has to say so in control flow. Checked
+    over all 35 and every core: the set of cores whose addressed slot is their own
+    is exactly the owner set, so a guard would only repeat the two composed types.
+    Leaving it out is also what keeps this spelling neutral on transport, which an
+    `scf.if` on the owner would have decided for pull.
     """
     keys = list(rec["source_extents"])
     rank = len(keys)
@@ -205,14 +299,38 @@ def emit_dist(row, rec):
     dst = [(p, o, *box_name(p, "dst"))
            for p in rec["destination_pieces"] for o in p["owners"]]
 
-    whole = name_for(box_set(rank, [0] * rank, extents), "all")
+    dps, piece, dlo, union, R, ostride = dest_geometry(rec, keys)
+    cores = sorted({o for p in dps for o in p["owners"]})
+    deriv = dest_derivation(rec, keys, cores)
+    rep = replica_index(dps, cores, R, ostride)
+    # The slots of one piece stack on dimension 0, so the composed destination is
+    # the union with that one dimension scaled by the replication factor.
+    agg = [union[0] * R] + union[1:]
+
+    blk = name_for(range_set(rank, piece), "blk")
     dims = ", ".join(f"d{i}" for i in range(rank))
     omap = name_for(f"affine_map<({dims}) -> ({dims})>", "ord")
 
-    whole_ty = f"memref<{'x'.join(map(str, extents))}x{elem}>"
-    tile_ty = f"!ktdp.access_tile<{'x'.join(map(str, extents))}xindex>"
-    idx_ty = f"<{'x'.join(map(str, extents))}xindex>"
-    tensor_ty = f"tensor<{'x'.join(map(str, extents))}x{elem}>"
+    src_ty = f"memref<{'x'.join(map(str, extents))}x{elem}>"
+    agg_ty = f"memref<{'x'.join(map(str, agg))}x{elem}>"
+    pc = "x".join(map(str, piece))
+    tile_ty = f"!ktdp.access_tile<{pc}xindex>"
+    idx_ty = f"<{pc}xindex>"
+    tensor_ty = f"tensor<{pc}x{elem}>"
+
+    consts = {0}
+
+    def c(v):
+        consts.add(v)
+        return f"%c{v}"
+
+    for v in deriv.values():
+        if v[0] == "const":
+            c(v[1])
+        else:
+            c(v[1]); c(v[2]); c(v[3])
+    if rep:
+        c(rep[0]); c(rep[1]); c(union[0])
 
     def view_lines(tag, entries, offset):
         out = []
@@ -225,13 +343,13 @@ def emit_dist(row, rec):
             out.append(f"      : memref<{'x'.join(map(str, size))}x{elem}, {sp}>")
         return out
 
-    def compose_lines(tag, entries, result):
+    def compose_lines(tag, entries, result, result_ty):
         ops = ", ".join(f"%{tag}{i}" for i in range(len(entries)))
         tys = ", ".join(
             f"memref<{'x'.join(map(str, e[3]))}x{elem}, "
             f"#ktdp.memory_space<ct_local, ct_id = {e[1]}>>" for e in entries)
         return [f"  %{result} = ktdp.construct_distributed_memory_view ({ops}",
-                f"      : {tys}) : {whole_ty}"]
+                f"      : {tys}) : {result_ty}"]
 
     ext_str = ", ".join(f"{k}: {rec['source_extents'][k]}" for k in keys)
     L = []
@@ -248,9 +366,23 @@ def emit_dist(row, rec):
       f"{len(rec['destination_pieces'])} piece(s) x "
       f"{len(rec['destination_pieces'][0]['owners'])} owner(s), "
       f"{owners_str([e[1] for e in dst])}")
+    A(f"// composed    source {'x'.join(map(str, extents))}, "
+      f"destination {'x'.join(map(str, agg))} = "
+      f"{'x'.join(map(str, union))} x {R} slot(s) per piece")
     A("//")
     A("// Both sides composed, so the function states the whole movement and needs no")
-    A("// launch table to be read. See README.md for the mapping and the provenance.")
+    A("// launch table to be read. The destination view is the whole of what its views")
+    A("// hold -- one slot per (piece, owner) -- so a core says which slot it writes:")
+    for k in keys:
+        v = deriv[k]
+        A(f"//     {k} = {v[1]}" if v[0] == "const"
+          else f"//     {k} = ((tid // {v[1]}) % {v[2]}) * {v[3]}")
+    if rep:
+        A(f"//     replica = (tid // {rep[0]}) % {rep[1]}, "
+          f"at {union[0]} per slot on dimension 0")
+    A(f"// Which cores take part is not stated: {len(cores)} of the 32 address a slot they")
+    A("// own, and the slot's own ct_id is what says so. See README.md for the mapping")
+    A("// and the provenance.")
     A("")
     for name, text in order:
         A(f"{name} = {text}")
@@ -259,32 +391,79 @@ def emit_dist(row, rec):
     fn = ident(f"{row['curated_id']}_{rec['phase']}_{rec['consumer_family']}"
                f"_input{rec['consumer_input_lds']}")
     A(f"func.func @{fn}(%src: index, %dst: index) {{")
-    A("  %c0 = arith.constant 0 : index")
+    for v in sorted(consts):
+        A(f"  %c{v} = arith.constant {v} : index")
+    # One destination piece held by one core needs no tile id at all: there is one
+    # slot, every core addresses it, and its ct_id says whose it is.
+    if rep or any(v[0] == "arith" for v in deriv.values()):
+        A("  %tid = ktdp.get_compute_tile_id : index")
     A("")
     A("  // The source distribution: one view per partition, differing ONLY in")
     A("  // coordinate_set and ct_id.")
     L.extend(view_lines("s", src, "%src"))
     A("")
-    L.extend(compose_lines("s", src, "from"))
+    L.extend(compose_lines("s", src, "from", src_ty))
     A("")
     A("  // The destination distribution, the same way. A piece with several owners")
     A("  // is that many views with the SAME coordinate_set and different ct_id --")
-    A("  // which is what replication is, stated rather than left to the launch.")
+    A("  // which is what replication is, stated rather than left to the launch. The")
+    A("  // composed type counts those views, so the slots are distinct coordinates")
+    A("  // and no coordinate has two writers.")
     L.extend(view_lines("d", dst, "%dst"))
     A("")
-    L.extend(compose_lines("d", dst, "to"))
+    L.extend(compose_lines("d", dst, "to", agg_ty))
     A("")
-    A("  // The movement. Whole-tensor on both sides: a relayout is a view-to-view")
-    A("  // copy, and with both distributions named there is no per-tile share left")
-    A("  // to anchor. Which side does the transferring is a lowering's choice.")
-    A(f"  %rt = ktdp.construct_access_tile %from[{', '.join('%c0' for _ in extents)}]")
-    A(f"      {{access_tile_order = {omap}, access_tile_set = {whole}}}")
-    A(f"      : {whole_ty} -> {tile_ty}")
-    A(f"  %val = ktdp.load %rt : {idx_ty} -> {tensor_ty}")
-    A(f"  %wt = ktdp.construct_access_tile %to[{', '.join('%c0' for _ in extents)}]")
-    A(f"      {{access_tile_order = {omap}, access_tile_set = {whole}}}")
-    A(f"      : {whole_ty} -> {tile_ty}")
-    A(f"  ktdp.store %val, %wt : {tensor_ty}, {idx_ty}")
+    mark = len(L)
+    if any(v[0] == "arith" for v in deriv.values()):
+        A("  // Where this core's box sits: one independent field of the tile id per")
+        A("  // divided dimension, exactly as in ../if-store/. No branch selects it --")
+        A("  // the index is computed.")
+    base = emit_base(A, keys, deriv)
+
+    # The destination side is indexed in the COMPOSED view's own space: a constant
+    # dimension is the union's origin, so it is 0 there whatever its global value,
+    # and dimension 0 carries the replica.
+    store = ["%c0" if deriv[k][0] == "const" else base[i]
+             for i, k in enumerate(keys)]
+    if rep:
+        a, b = rep
+        if len(L) > mark:
+            A("")
+        A("  // Which of the slots is this core's: its position in its piece's owner")
+        A("  // list, stacked on dimension 0 of the composed destination.")
+        q = "%tid"
+        if a != 1:
+            A(f"  %q_rep = arith.divsi %tid, %c{a} : index")
+            q = "%q_rep"
+        A(f"  %i_rep = arith.remsi {q}, %c{b} : index")
+        slot = "%i_rep"
+        if union[0] != 1:
+            A(f"  %o_rep = arith.muli %i_rep, %c{union[0]} : index")
+            slot = "%o_rep"
+        if store[0] == "%c0":
+            store[0] = slot
+        else:
+            A(f"  %base_{keys[0]} = arith.addi {slot}, {store[0]} : index")
+            store[0] = f"%base_{keys[0]}"
+    if len(L) > mark:
+        A("")
+
+    def movement(indent):
+        pad = " " * indent
+        A(f"{pad}%rt = ktdp.construct_access_tile %from[{', '.join(base)}]")
+        A(f"{pad}    {{access_tile_order = {omap}, access_tile_set = {blk}}}")
+        A(f"{pad}    : {src_ty} -> {tile_ty}")
+        A(f"{pad}%val = ktdp.load %rt : {idx_ty} -> {tensor_ty}")
+        A(f"{pad}%wt = ktdp.construct_access_tile %to[{', '.join(store)}]")
+        A(f"{pad}    {{access_tile_order = {omap}, access_tile_set = {blk}}}")
+        A(f"{pad}    : {agg_ty} -> {tile_ty}")
+        A(f"{pad}ktdp.store %val, %wt : {tensor_ty}, {idx_ty}")
+
+    A("  // The movement, and no control flow: one load of a coordinate REGION --")
+    A("  // which source partitions that touches is the composed view's to resolve,")
+    A("  // and a region may span several -- and one store into a named slot of the")
+    A("  // destination, whose ct_id is what says whether this core owns it.")
+    movement(2)
     A("")
     A("  return")
     A("}")
@@ -430,23 +609,7 @@ def emit_if(row, rec, grid=32):
     A("  // Where in the tensor this core's box starts: one independent field of the")
     A("  // tile id per divided dimension. No branch, because nothing is selected --")
     A("  // the index is computed.")
-    base = []
-    for k in keys:
-        v = deriv[k]
-        if v[0] == "const":
-            base.append(f"%c{v[1]}")
-            continue
-        _, a, b, extent = v
-        q = "%tid"
-        if a != 1:
-            A(f"  %q_{k} = arith.divsi %tid, %c{a} : index")
-            q = f"%q_{k}"
-        A(f"  %i_{k} = arith.remsi {q}, %c{b} : index")
-        if extent == 1:
-            base.append(f"%i_{k}")
-        else:
-            A(f"  %o_{k} = arith.muli %i_{k}, %c{extent} : index")
-            base.append(f"%o_{k}")
+    base = emit_base(A, keys, deriv)
     A("")
 
     def movement(indent):
@@ -559,8 +722,8 @@ def readme(records, form):
         A("")
         A("| | |")
         A("|---|---|")
-        A("| [`dist-store/`](dist-store/) | both sides composed. The destination is a distributed memory view too, and the whole movement is one `ktdp.load` and one `ktdp.store`. |")
-        A("| [`if-store/`](if-store/) | only the **source** is composed. Each core lands its own piece in its own scratchpad, and which piece that is comes from the tile id. |")
+        A("| [`dist-store/`](dist-store/) | both sides composed. The destination is a distributed memory view too, so a core stores into **its slot of the whole** rather than into a buffer of its own. |")
+        A("| [`if-store/`](if-store/) | only the **source** is composed. Each core lands its own piece in its own scratchpad, at local coordinate zero. |")
         A("")
         A("**Neither is decided.** They are here to be read against each other, and each")
         A("directory\'s README states what its spelling buys and what it costs. The question")
@@ -574,8 +737,25 @@ def readme(records, form):
         A("example from one tile\'s point of view, with a comment saying the other cores do")
         A("the same: C001 lands the whole tensor on all 32 cores, and the only \"32\" in the")
         A("file was prose. `dist-store` puts it in the type system, as one view per")
-        A("*(piece, owner)* pair; `if-store` puts it in index arithmetic on the tile id, with")
-        A("control flow only where some cores do not take part.")
+        A("*(piece, owner)* pair; `if-store` leaves it out of the destination side entirely,")
+        A("because a landing in this core\'s own scratchpad says nothing about the others.")
+        A("")
+        A("**Both forms derive a core\'s box from the tile id**, by the same arithmetic.")
+        A("That used to be `if-store`\'s distinguishing feature and is not: once the composed")
+        A("destination is the whole of what its views hold, a store has to say which slot of")
+        A("it this core writes. What is left of the contrast is two lines:")
+        A("")
+        A("| | `dist-store` | `if-store` |")
+        A("|---|---|---|")
+        A("| the store\'s destination | the composed view, at this core\'s slot: the piece\'s position in the box the pieces tile, plus its replica on dimension 0 | a local view, at zero. Which global coordinates it holds is not in the IR |")
+        A("| participation | **not stated.** The slot carries its holder\'s `ct_id`, so a core that addresses a slot it does not own is asking for a remote write | an `scf.if` on the tile id, in %d of the 35. A local landing names no holder, so nothing else could say it" % len(_guarded(records)))
+        A("")
+        A("The second line is the sharper difference, and it is the one to argue about: it")
+        A("says a composed destination makes participation a **consequence** of the two")
+        A("statements the file already makes, where a local landing makes it a third")
+        A("statement that could disagree with them. Checked over all 35 and every core: the")
+        A("cores whose addressed slot is their own are exactly the owner set, so the guard")
+        A("`dist-store` does not have would have been redundant with its types.")
         A("")
         A("They are **examples, not tests**. Nothing lowers")
         A("`ktdp.construct_distributed_memory_view` in tree yet and dbo-opt\'s legality check")
@@ -593,12 +773,29 @@ def readme(records, form):
         A("|---|---|")
         A("| a piece\'s `start` and `size` | the `coordinate_set`, as the box `[start, start + size)` in the tensor\'s global index space |")
         A("| each of that piece\'s `owners` | one view per owner, `memory_space = #ktdp.memory_space<ct_local, ct_id = N>`, repeated in the result memref type |")
-        A("| the union of a side\'s pieces | that side\'s composed result shape |")
+        A("| a side\'s pieces and their owners | that side\'s composed result shape: the box the pieces tile, with dimension 0 scaled by the number of owners each piece has |")
         A("| `word_length` | the element type: 2 bytes, so `f16` throughout |")
         A("")
-        A("Source and destination extents are identical in all 35, and each side\'s boxes")
-        A("union to exactly those extents, so a composed view of either side has the same")
-        A("type and a copy between them needs no reshaping.")
+        A("**A composed view is the whole of what its views hold**, which is not the same")
+        A("thing as the box they cover, and two of the 35 show why each half of that")
+        A("matters. The rule is one sentence -- every `(piece, owner)` pair is a slot of the")
+        A("result, and the slots of one piece stack on dimension 0 -- and the consequences")
+        A("are:")
+        A("")
+        A("- **Replication multiplies.** C002\'s destination is the whole 4096-element")
+        A("  tensor held by 16 cores, so its composed type is `memref<65536x1x1xf16>` and")
+        A("  not `memref<4096x1x1xf16>`. The 16 copies are real memory and each is")
+        A("  addressable; a type that named the coordinates once would describe a sixteenth")
+        A("  of what the views hold.")
+        A("- **A side need not cover the tensor.** C035\'s destination pieces all sit at")
+        A("  `mb = 511`, so the box they tile is `1x4096x1` -- one row of 512 -- and that is")
+        A("  its composed extent. An earlier revision used the tensor\'s extents on both")
+        A("  sides and typed it `512x4096x1`, a view 512 times the memory behind it.")
+        A("")
+        A("So the two sides of one movement do **not** in general have the same composed")
+        A("type, even though the source and destination *extents* are identical in all 35.")
+        A("A load and a store therefore name a box rather than the whole: the box is this")
+        A("core\'s piece, and its position is where each spelling differs.")
         A("")
         A("Three conventions the source record does not dictate:")
         A("")
@@ -682,11 +879,19 @@ def readme(records, form):
         A("|---|---|")
         A("| the source distribution | one `ktdp.construct_memory_view` per source piece, composed by `ktdp.construct_distributed_memory_view` |")
         A("| the destination distribution | the same, one view per destination *(piece, owner)* pair, composed the same way |")
-        A("| the movement | one `ktdp.construct_access_tile` + `ktdp.load` on the source, one tile + `ktdp.store` on the destination, whole-tensor on both sides |")
+        A("| the movement | `ktdp.get_compute_tile_id` and the index arithmetic for this core\'s box, then one `ktdp.construct_access_tile` + `ktdp.load` on the source and one tile + `ktdp.store` into this core\'s slot of the destination |")
         A("")
-        A("There is no tile id in these files and no control flow. Every core runs the same")
-        A("two ops, and what varies between cores is carried entirely by the `ct_id`s in the")
-        A("two composed types.")
+        A("**There is no control flow in these files.** Every core runs the same two")
+        A("transfers, and which of them is the slot\'s holder is carried by the `ct_id` in")
+        A("the composed destination\'s type rather than by a guard -- see the parent README\'s")
+        A("participation row. Two files have no tile id either (C010, C019: one piece, one")
+        A("owner, so there is one slot and nothing to select).")
+        A("")
+        A("**The composed destination is the whole of what its views hold.** Every")
+        A("*(piece, owner)* pair is a slot of the result and the slots of one piece stack on")
+        A("dimension 0, so C002 -- the whole 4096-element tensor on 16 cores -- composes to")
+        A("`memref<65536x1x1xf16>`. [The parent README](../README.md) states the rule and")
+        A("the other case it decides, C035, whose destination covers one row of 512.")
         A("")
         A("## What composing the destination buys")
         A("")
@@ -695,24 +900,44 @@ def readme(records, form):
         A("what replication is. C001\'s destination is one piece held by all 32 cores, and")
         A("here that is 32 views -- the breadth is in the IR rather than in the launch.")
         A("")
-        A("**It takes no side on transport.** With both distributions named, *which* side")
-        A("does the transferring is a lowering\'s choice: pull, where each destination holder")
-        A("reads its share, or push. `if-store` has pull in its shape.")
+        A("**It answers §4\'s objection rather than setting it aside.**")
+        A("[§4](../../inter-tile-lowering-to-mem-view.md) calls a destination view")
+        A("\"meaningless where destinations are replicated\", because it would have \"two")
+        A("writers for one coordinate with nothing saying which wins\". Under the rule above")
+        A("there are no two writers: the 16 copies of C002 are 16 slots, each written by its")
+        A("own owner, and a reader of the IR can say which core wrote which bytes. The")
+        A("objection holds against a composed destination typed as the coordinates once,")
+        A("which is what an earlier revision of these files emitted.")
         A("")
-        A("**The movement is two ops regardless of geometry.** A 32-to-32 permutation reads")
-        A("the same as a 1-to-1 remap; nothing about the owner map reaches the movement.")
+        A("**Ownership stays readable at the destination.** A store names the global box it")
+        A("lands, so the IR says which coordinates a core holds; `if-store` moves that into")
+        A("the load\'s base indices and leaves the landing anonymous.")
+        A("")
+        A("**It takes no side on transport.** With both distributions named and no guard on")
+        A("the store, *which* side does the transferring is a lowering\'s choice: pull, where")
+        A("the slot\'s holder is the one that moves it, or push. A guard on \"am I the holder\"")
+        A("would have chosen pull in the IR, which is `if-store`\'s shape and is the reason")
+        A("there is no `scf.if` here.")
         A("")
         A("## What it costs")
         A("")
-        A("**It diverges from the design.**")
-        A("[§4](../../inter-tile-lowering-to-mem-view.md) composes only the source and calls")
-        A("a destination view \"meaningless where destinations are replicated\", on the grounds")
-        A("that it would have \"two writers for one coordinate with nothing saying which")
-        A("wins\". That argument does not hold for a broadcast, where the writers agree and")
-        A("every holder receives the same bytes -- but it is unanswered in general, and the")
-        A("op\'s own documentation leaves overlapping coordinate sets \"unspecified unless ...")
-        A("constrained by ... program semantics\". The semantics is here a comment, not a")
-        A("check.")
+        A("**A written distributed view implies remote writes.** §4\'s other objection")
+        A("stands: cross-core *reads* are what the interconnect is described as supporting,")
+        A("and storing through a composed destination asks for the unverified direction.")
+        A("Nothing in this tree can yet say whether a lowering would -- though with the")
+        A("slots distinct, a lowering is free to realize each store locally, which is")
+        A("`if-store`\'s shape arrived at by analysis rather than by spelling.")
+        A("")
+        A("**It asks more of the backend.** Participation is derivable rather than stated,")
+        A("so a lowering has to fold the index expression against the tile id and compare")
+        A("the result with the slot\'s `ct_id`. `if-store` asks nothing: the guard is there")
+        A("to read. These files are evidence for the first reading being enough, not proof")
+        A("-- nothing in tree lowers either form yet.")
+        A("")
+        A("**The index arithmetic is not saved.** An earlier revision of these files had no")
+        A("tile id at all, because every core stored the whole tensor through a view typed")
+        A("as the coordinates once. That was the thing the rule above rejects, so the saving")
+        A("went with it: both spellings now derive the box from the tile id.")
         A("")
         A("**A written distributed view implies remote writes.** §4\'s other objection is")
         A("that cross-core *reads* are what the interconnect is described as supporting while")
@@ -757,9 +982,9 @@ def readme(records, form):
       % _spanning(records))
     A("all %d of them (C001, whose single destination piece is the whole tensor)."
       % _max_span(records))
-    A("This is exactly `dist-store`\'s property too -- its one whole-tensor load spans every")
-    A("source piece -- but it is worth saying here, because \"each core reads its own")
-    A("piece\" invites the reading that one load is one source tile. It is not.")
+    A("This is exactly `dist-store`\'s property too -- the two spellings share both the box")
+    A("and the arithmetic that places it -- but it is worth saying here, because \"each core")
+    A("reads its own piece\" invites the reading that one load is one source tile. It is not.")
     A("")
     A("**`ktdp.load` stays inside the guard, with the store**, in the files that have one.")
     A("The load *is* the transfer. `construct_access_tile` is `Pure` and may be hoisted;")

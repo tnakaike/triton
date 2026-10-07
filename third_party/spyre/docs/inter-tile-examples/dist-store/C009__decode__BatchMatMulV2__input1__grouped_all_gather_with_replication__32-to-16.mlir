@@ -4,9 +4,20 @@
 //
 // source      32 view(s) = 32 piece(s) x 1 owner, ct 0..31
 // destination 32 view(s) = 16 piece(s) x 2 owner(s), ct 0..31
+// composed    source 768x128x8x1x1, destination 1536x128x8x1x1 = 768x128x8x1x1 x 2 slot(s) per piece
 //
 // Both sides composed, so the function states the whole movement and needs no
-// launch table to be read. See README.md for the mapping and the provenance.
+// launch table to be read. The destination view is the whole of what its views
+// hold -- one slot per (piece, owner) -- so a core says which slot it writes:
+//     in = 0
+//     out = ((tid // 16) % 2) * 64
+//     x = ((tid // 2) % 8) * 1
+//     x1 = 0
+//     y = 0
+//     replica = (tid // 1) % 2, at 768 per slot on dimension 0
+// Which cores take part is not stated: 32 of the 32 address a slot they
+// own, and the slot's own ct_id is what says so. See README.md for the mapping
+// and the provenance.
 
 #src0 = affine_set<(d0, d1, d2, d3, d4) : (d0 >= 0, -d0 + 23 >= 0, d1 >= 0, -d1 + 127 >= 0, d2 >= 0, -d2 + 7 >= 0, d3 >= 0, -d3 >= 0, d4 >= 0, -d4 >= 0)>
 #src1 = affine_set<(d0, d1, d2, d3, d4) : (d0 - 24 >= 0, -d0 + 47 >= 0, d1 >= 0, -d1 + 127 >= 0, d2 >= 0, -d2 + 7 >= 0, d3 >= 0, -d3 >= 0, d4 >= 0, -d4 >= 0)>
@@ -56,11 +67,17 @@
 #dst13 = affine_set<(d0, d1, d2, d3, d4) : (d0 >= 0, -d0 + 767 >= 0, d1 >= 0, -d1 + 63 >= 0, d2 - 7 >= 0, -d2 + 7 >= 0, d3 >= 0, -d3 >= 0, d4 >= 0, -d4 >= 0)>
 #dst14 = affine_set<(d0, d1, d2, d3, d4) : (d0 >= 0, -d0 + 767 >= 0, d1 - 64 >= 0, -d1 + 127 >= 0, d2 >= 0, -d2 >= 0, d3 >= 0, -d3 >= 0, d4 >= 0, -d4 >= 0)>
 #dst15 = affine_set<(d0, d1, d2, d3, d4) : (d0 >= 0, -d0 + 767 >= 0, d1 - 64 >= 0, -d1 + 127 >= 0, d2 - 1 >= 0, -d2 + 1 >= 0, d3 >= 0, -d3 >= 0, d4 >= 0, -d4 >= 0)>
-#all0 = affine_set<(d0, d1, d2, d3, d4) : (d0 >= 0, -d0 + 767 >= 0, d1 >= 0, -d1 + 127 >= 0, d2 >= 0, -d2 + 7 >= 0, d3 >= 0, -d3 >= 0, d4 >= 0, -d4 >= 0)>
 #ord0 = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3, d4)>
 
 func.func @c009_decode_batchmatmulv2_input1(%src: index, %dst: index) {
   %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c2 = arith.constant 2 : index
+  %c8 = arith.constant 8 : index
+  %c16 = arith.constant 16 : index
+  %c64 = arith.constant 64 : index
+  %c768 = arith.constant 768 : index
+  %tid = ktdp.get_compute_tile_id : index
 
   // The source distribution: one view per partition, differing ONLY in
   // coordinate_set and ct_id.
@@ -166,7 +183,9 @@ func.func @c009_decode_batchmatmulv2_input1(%src: index, %dst: index) {
 
   // The destination distribution, the same way. A piece with several owners
   // is that many views with the SAME coordinate_set and different ct_id --
-  // which is what replication is, stated rather than left to the launch.
+  // which is what replication is, stated rather than left to the launch. The
+  // composed type counts those views, so the slots are distinct coordinates
+  // and no coordinate has two writers.
   %d0 = ktdp.construct_memory_view %dst, sizes: [768, 64, 1, 1, 1], strides: [64, 1, 1, 1, 1]
       {coordinate_set = #dst0, memory_space = #ktdp.memory_space<ct_local, ct_id = 0>}
       : memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 0>>
@@ -265,19 +284,34 @@ func.func @c009_decode_batchmatmulv2_input1(%src: index, %dst: index) {
       : memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 19>>
 
   %to = ktdp.construct_distributed_memory_view (%d0, %d1, %d2, %d3, %d4, %d5, %d6, %d7, %d8, %d9, %d10, %d11, %d12, %d13, %d14, %d15, %d16, %d17, %d18, %d19, %d20, %d21, %d22, %d23, %d24, %d25, %d26, %d27, %d28, %d29, %d30, %d31
-      : memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 0>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 1>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 2>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 3>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 20>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 21>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 22>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 23>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 24>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 25>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 26>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 27>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 28>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 29>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 30>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 31>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 4>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 5>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 6>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 7>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 8>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 9>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 10>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 11>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 12>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 13>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 14>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 15>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 16>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 17>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 18>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 19>>) : memref<768x128x8x1x1xf16>
+      : memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 0>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 1>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 2>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 3>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 20>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 21>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 22>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 23>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 24>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 25>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 26>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 27>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 28>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 29>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 30>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 31>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 4>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 5>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 6>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 7>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 8>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 9>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 10>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 11>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 12>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 13>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 14>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 15>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 16>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 17>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 18>>, memref<768x64x1x1x1xf16, #ktdp.memory_space<ct_local, ct_id = 19>>) : memref<1536x128x8x1x1xf16>
 
-  // The movement. Whole-tensor on both sides: a relayout is a view-to-view
-  // copy, and with both distributions named there is no per-tile share left
-  // to anchor. Which side does the transferring is a lowering's choice.
-  %rt = ktdp.construct_access_tile %from[%c0, %c0, %c0, %c0, %c0]
-      {access_tile_order = #ord0, access_tile_set = #all0}
-      : memref<768x128x8x1x1xf16> -> !ktdp.access_tile<768x128x8x1x1xindex>
-  %val = ktdp.load %rt : <768x128x8x1x1xindex> -> tensor<768x128x8x1x1xf16>
-  %wt = ktdp.construct_access_tile %to[%c0, %c0, %c0, %c0, %c0]
-      {access_tile_order = #ord0, access_tile_set = #all0}
-      : memref<768x128x8x1x1xf16> -> !ktdp.access_tile<768x128x8x1x1xindex>
-  ktdp.store %val, %wt : tensor<768x128x8x1x1xf16>, <768x128x8x1x1xindex>
+  // Where this core's box sits: one independent field of the tile id per
+  // divided dimension, exactly as in ../if-store/. No branch selects it --
+  // the index is computed.
+  %q_out = arith.divsi %tid, %c16 : index
+  %i_out = arith.remsi %q_out, %c2 : index
+  %o_out = arith.muli %i_out, %c64 : index
+  %q_x = arith.divsi %tid, %c2 : index
+  %i_x = arith.remsi %q_x, %c8 : index
+
+  // Which of the slots is this core's: its position in its piece's owner
+  // list, stacked on dimension 0 of the composed destination.
+  %i_rep = arith.remsi %tid, %c2 : index
+  %o_rep = arith.muli %i_rep, %c768 : index
+
+  // The movement, and no control flow: one load of a coordinate REGION --
+  // which source partitions that touches is the composed view's to resolve,
+  // and a region may span several -- and one store into a named slot of the
+  // destination, whose ct_id is what says whether this core owns it.
+  %rt = ktdp.construct_access_tile %from[%c0, %o_out, %i_x, %c0, %c0]
+      {access_tile_order = #ord0, access_tile_set = #dst0}
+      : memref<768x128x8x1x1xf16> -> !ktdp.access_tile<768x64x1x1x1xindex>
+  %val = ktdp.load %rt : <768x64x1x1x1xindex> -> tensor<768x64x1x1x1xf16>
+  %wt = ktdp.construct_access_tile %to[%o_rep, %o_out, %i_x, %c0, %c0]
+      {access_tile_order = #ord0, access_tile_set = #dst0}
+      : memref<1536x128x8x1x1xf16> -> !ktdp.access_tile<768x64x1x1x1xindex>
+  ktdp.store %val, %wt : tensor<768x64x1x1x1xf16>, <768x64x1x1x1xindex>
 
   return
 }

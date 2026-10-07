@@ -28,9 +28,9 @@ coordinates appear in the load alone, which is where the per-core difference is.
 region touches is the composed view's to resolve, and a region may span many of
 them: in 25 of the 35 a destination box overlaps more than one source piece, up to
 all 32 of them (C001, whose single destination piece is the whole tensor).
-This is exactly `dist-store`'s property too -- its one whole-tensor load spans every
-source piece -- but it is worth saying here, because "each core reads its own
-piece" invites the reading that one load is one source tile. It is not.
+This is exactly `dist-store`'s property too -- the two spellings share both the box
+and the arithmetic that places it -- but it is worth saying here, because "each core
+reads its own piece" invites the reading that one load is one source tile. It is not.
 
 **`ktdp.load` stays inside the guard, with the store**, in the files that have one.
 The load *is* the transfer. `construct_access_tile` is `Pure` and may be hoisted;

@@ -5,8 +5,8 @@ spellings of the same movement**:
 
 | | |
 |---|---|
-| [`dist-store/`](dist-store/) | both sides composed. The destination is a distributed memory view too, and the whole movement is one `ktdp.load` and one `ktdp.store`. |
-| [`if-store/`](if-store/) | only the **source** is composed. Each core lands its own piece in its own scratchpad, and which piece that is comes from the tile id. |
+| [`dist-store/`](dist-store/) | both sides composed. The destination is a distributed memory view too, so a core stores into **its slot of the whole** rather than into a buffer of its own. |
+| [`if-store/`](if-store/) | only the **source** is composed. Each core lands its own piece in its own scratchpad, at local coordinate zero. |
 
 **Neither is decided.** They are here to be read against each other, and each
 directory's README states what its spelling buys and what it costs. The question
@@ -20,8 +20,25 @@ that **the breadth of a relayout belongs in the IR**. That revision wrote each
 example from one tile's point of view, with a comment saying the other cores do
 the same: C001 lands the whole tensor on all 32 cores, and the only "32" in the
 file was prose. `dist-store` puts it in the type system, as one view per
-*(piece, owner)* pair; `if-store` puts it in index arithmetic on the tile id, with
-control flow only where some cores do not take part.
+*(piece, owner)* pair; `if-store` leaves it out of the destination side entirely,
+because a landing in this core's own scratchpad says nothing about the others.
+
+**Both forms derive a core's box from the tile id**, by the same arithmetic.
+That used to be `if-store`'s distinguishing feature and is not: once the composed
+destination is the whole of what its views hold, a store has to say which slot of
+it this core writes. What is left of the contrast is two lines:
+
+| | `dist-store` | `if-store` |
+|---|---|---|
+| the store's destination | the composed view, at this core's slot: the piece's position in the box the pieces tile, plus its replica on dimension 0 | a local view, at zero. Which global coordinates it holds is not in the IR |
+| participation | **not stated.** The slot carries its holder's `ct_id`, so a core that addresses a slot it does not own is asking for a remote write | an `scf.if` on the tile id, in 10 of the 35. A local landing names no holder, so nothing else could say it
+
+The second line is the sharper difference, and it is the one to argue about: it
+says a composed destination makes participation a **consequence** of the two
+statements the file already makes, where a local landing makes it a third
+statement that could disagree with them. Checked over all 35 and every core: the
+cores whose addressed slot is their own are exactly the owner set, so the guard
+`dist-store` does not have would have been redundant with its types.
 
 They are **examples, not tests**. Nothing lowers
 `ktdp.construct_distributed_memory_view` in tree yet and dbo-opt's legality check
@@ -39,12 +56,29 @@ are chosen to isolate one question at a time; these are whatever a real model di
 |---|---|
 | a piece's `start` and `size` | the `coordinate_set`, as the box `[start, start + size)` in the tensor's global index space |
 | each of that piece's `owners` | one view per owner, `memory_space = #ktdp.memory_space<ct_local, ct_id = N>`, repeated in the result memref type |
-| the union of a side's pieces | that side's composed result shape |
+| a side's pieces and their owners | that side's composed result shape: the box the pieces tile, with dimension 0 scaled by the number of owners each piece has |
 | `word_length` | the element type: 2 bytes, so `f16` throughout |
 
-Source and destination extents are identical in all 35, and each side's boxes
-union to exactly those extents, so a composed view of either side has the same
-type and a copy between them needs no reshaping.
+**A composed view is the whole of what its views hold**, which is not the same
+thing as the box they cover, and two of the 35 show why each half of that
+matters. The rule is one sentence -- every `(piece, owner)` pair is a slot of the
+result, and the slots of one piece stack on dimension 0 -- and the consequences
+are:
+
+- **Replication multiplies.** C002's destination is the whole 4096-element
+  tensor held by 16 cores, so its composed type is `memref<65536x1x1xf16>` and
+  not `memref<4096x1x1xf16>`. The 16 copies are real memory and each is
+  addressable; a type that named the coordinates once would describe a sixteenth
+  of what the views hold.
+- **A side need not cover the tensor.** C035's destination pieces all sit at
+  `mb = 511`, so the box they tile is `1x4096x1` -- one row of 512 -- and that is
+  its composed extent. An earlier revision used the tensor's extents on both
+  sides and typed it `512x4096x1`, a view 512 times the memory behind it.
+
+So the two sides of one movement do **not** in general have the same composed
+type, even though the source and destination *extents* are identical in all 35.
+A load and a store therefore name a box rather than the whole: the box is this
+core's piece, and its position is where each spelling differs.
 
 Three conventions the source record does not dictate:
 
