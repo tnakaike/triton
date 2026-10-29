@@ -7,16 +7,14 @@
 // composed    source 128x512x8x1x4, destination 128x512x8x1x4 = 128x512x8x1x4 x 1 slot(s) per piece
 //
 // Both sides composed, so the function states the whole movement and needs no
-// launch table to be read. The destination view is the whole of what its views
-// hold -- one slot per (piece, owner) -- so a core says which slot it writes:
+// launch table to be read. The destination is a global view of disjoint
+// slots, one per (piece, owner), so a core says which slot it writes:
 //     in = 0
 //     mb = ((tid // 1) % 32) * 16
 //     x = 0
 //     x1 = 0
 //     y = 0
-// Which cores take part is not stated: 32 of the 32 address a slot they
-// own, and the slot's own ct_id is what says so. See README.md for the mapping
-// and the provenance.
+// Every core owns a slot. See README.md for the mapping and the provenance.
 
 #src0 = affine_set<(d0, d1, d2, d3, d4) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 63 >= 0, d2 >= 0, -d2 + 1 >= 0, d3 >= 0, -d3 >= 0, d4 >= 0, -d4 + 3 >= 0)>
 #src1 = affine_set<(d0, d1, d2, d3, d4) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 63 >= 0, d2 - 2 >= 0, -d2 + 3 >= 0, d3 >= 0, -d3 >= 0, d4 >= 0, -d4 + 3 >= 0)>
@@ -194,10 +192,10 @@ func.func @c024_prefill_batchmatmulv2_input0(%src: index, %dst: index) {
       : memref<128x64x2x1x4xf16, #ktdp.memory_space<ct_local, ct_id = 0>>, memref<128x64x2x1x4xf16, #ktdp.memory_space<ct_local, ct_id = 1>>, memref<128x64x2x1x4xf16, #ktdp.memory_space<ct_local, ct_id = 10>>, memref<128x64x2x1x4xf16, #ktdp.memory_space<ct_local, ct_id = 11>>, memref<128x64x2x1x4xf16, #ktdp.memory_space<ct_local, ct_id = 12>>, memref<128x64x2x1x4xf16, #ktdp.memory_space<ct_local, ct_id = 13>>, memref<128x64x2x1x4xf16, #ktdp.memory_space<ct_local, ct_id = 14>>, memref<128x64x2x1x4xf16, #ktdp.memory_space<ct_local, ct_id = 15>>, memref<128x64x2x1x4xf16, #ktdp.memory_space<ct_local, ct_id = 16>>, memref<128x64x2x1x4xf16, #ktdp.memory_space<ct_local, ct_id = 17>>, memref<128x64x2x1x4xf16, #ktdp.memory_space<ct_local, ct_id = 18>>, memref<128x64x2x1x4xf16, #ktdp.memory_space<ct_local, ct_id = 19>>, memref<128x64x2x1x4xf16, #ktdp.memory_space<ct_local, ct_id = 2>>, memref<128x64x2x1x4xf16, #ktdp.memory_space<ct_local, ct_id = 20>>, memref<128x64x2x1x4xf16, #ktdp.memory_space<ct_local, ct_id = 21>>, memref<128x64x2x1x4xf16, #ktdp.memory_space<ct_local, ct_id = 22>>, memref<128x64x2x1x4xf16, #ktdp.memory_space<ct_local, ct_id = 23>>, memref<128x64x2x1x4xf16, #ktdp.memory_space<ct_local, ct_id = 24>>, memref<128x64x2x1x4xf16, #ktdp.memory_space<ct_local, ct_id = 25>>, memref<128x64x2x1x4xf16, #ktdp.memory_space<ct_local, ct_id = 26>>, memref<128x64x2x1x4xf16, #ktdp.memory_space<ct_local, ct_id = 27>>, memref<128x64x2x1x4xf16, #ktdp.memory_space<ct_local, ct_id = 28>>, memref<128x64x2x1x4xf16, #ktdp.memory_space<ct_local, ct_id = 29>>, memref<128x64x2x1x4xf16, #ktdp.memory_space<ct_local, ct_id = 3>>, memref<128x64x2x1x4xf16, #ktdp.memory_space<ct_local, ct_id = 30>>, memref<128x64x2x1x4xf16, #ktdp.memory_space<ct_local, ct_id = 31>>, memref<128x64x2x1x4xf16, #ktdp.memory_space<ct_local, ct_id = 4>>, memref<128x64x2x1x4xf16, #ktdp.memory_space<ct_local, ct_id = 5>>, memref<128x64x2x1x4xf16, #ktdp.memory_space<ct_local, ct_id = 6>>, memref<128x64x2x1x4xf16, #ktdp.memory_space<ct_local, ct_id = 7>>, memref<128x64x2x1x4xf16, #ktdp.memory_space<ct_local, ct_id = 8>>, memref<128x64x2x1x4xf16, #ktdp.memory_space<ct_local, ct_id = 9>>) : memref<128x512x8x1x4xf16>
 
   // The destination distribution, the same way. A piece with several owners
-  // is that many views with the SAME coordinate_set and different ct_id --
-  // which is what replication is, stated rather than left to the launch. The
-  // composed type counts those views, so the slots are distinct coordinates
-  // and no coordinate has two writers.
+  // is that many views, one per owner, each a distinct SLOT of the composed
+  // view: the slots of one piece stack on dimension 0, so their coordinate
+  // sets are disjoint and no coordinate has two writers. Coordinates are the
+  // composed view's own, starting at 0.
   %d0 = ktdp.construct_memory_view %dst, sizes: [128, 16, 8, 1, 4], strides: [512, 32, 4, 4, 1]
       {coordinate_set = #dst0, memory_space = #ktdp.memory_space<ct_local, ct_id = 0>}
       : memref<128x16x8x1x4xf16, #ktdp.memory_space<ct_local, ct_id = 0>>
@@ -304,10 +302,9 @@ func.func @c024_prefill_batchmatmulv2_input0(%src: index, %dst: index) {
   %i_mb = arith.remsi %tid, %c32 : index
   %o_mb = arith.muli %i_mb, %c16 : index
 
-  // The movement, and no control flow: one load of a coordinate REGION --
-  // which source partitions that touches is the composed view's to resolve,
-  // and a region may span several -- and one store into a named slot of the
-  // destination, whose ct_id is what says whether this core owns it.
+  // The movement: one load of a coordinate REGION -- which source partitions
+  // that touches is the composed view's to resolve, and a region may span
+  // several -- and one store into this core's own slot of the destination.
   %rt = ktdp.construct_access_tile %from[%c0, %o_mb, %c0, %c0, %c0]
       {access_tile_order = #ord0, access_tile_set = #dst0}
       : memref<128x512x8x1x4xf16> -> !ktdp.access_tile<128x16x8x1x4xindex>

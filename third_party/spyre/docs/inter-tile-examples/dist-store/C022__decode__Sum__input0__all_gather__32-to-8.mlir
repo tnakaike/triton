@@ -7,15 +7,14 @@
 // composed    source 1x32x768x1, destination 1x32x768x1 = 1x32x768x1 x 1 slot(s) per piece
 //
 // Both sides composed, so the function states the whole movement and needs no
-// launch table to be read. The destination view is the whole of what its views
-// hold -- one slot per (piece, owner) -- so a core says which slot it writes:
+// launch table to be read. The destination is a global view of disjoint
+// slots, one per (piece, owner), so a core says which slot it writes:
 //     i = 0
 //     mb = ((tid // 4) % 8) * 4
 //     out = 0
 //     x = 0
-// Which cores take part is not stated: 8 of the 32 address a slot they
-// own, and the slot's own ct_id is what says so. See README.md for the mapping
-// and the provenance.
+// 8 of the 32 cores own a slot, and an scf.if on the tile id keeps the
+// others from storing. See README.md for the mapping and the provenance.
 
 #src0 = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 3 >= 0, d2 >= 0, -d2 + 191 >= 0, d3 >= 0, -d3 >= 0)>
 #src1 = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 >= 0, d1 - 4 >= 0, -d1 + 7 >= 0, d2 >= 0, -d2 + 191 >= 0, d3 >= 0, -d3 >= 0)>
@@ -168,10 +167,10 @@ func.func @c022_decode_sum_input0(%src: index, %dst: index) {
       : memref<1x4x192x1xf16, #ktdp.memory_space<ct_local, ct_id = 0>>, memref<1x4x192x1xf16, #ktdp.memory_space<ct_local, ct_id = 1>>, memref<1x4x192x1xf16, #ktdp.memory_space<ct_local, ct_id = 10>>, memref<1x4x192x1xf16, #ktdp.memory_space<ct_local, ct_id = 11>>, memref<1x4x192x1xf16, #ktdp.memory_space<ct_local, ct_id = 12>>, memref<1x4x192x1xf16, #ktdp.memory_space<ct_local, ct_id = 13>>, memref<1x4x192x1xf16, #ktdp.memory_space<ct_local, ct_id = 14>>, memref<1x4x192x1xf16, #ktdp.memory_space<ct_local, ct_id = 15>>, memref<1x4x192x1xf16, #ktdp.memory_space<ct_local, ct_id = 16>>, memref<1x4x192x1xf16, #ktdp.memory_space<ct_local, ct_id = 17>>, memref<1x4x192x1xf16, #ktdp.memory_space<ct_local, ct_id = 18>>, memref<1x4x192x1xf16, #ktdp.memory_space<ct_local, ct_id = 19>>, memref<1x4x192x1xf16, #ktdp.memory_space<ct_local, ct_id = 2>>, memref<1x4x192x1xf16, #ktdp.memory_space<ct_local, ct_id = 20>>, memref<1x4x192x1xf16, #ktdp.memory_space<ct_local, ct_id = 21>>, memref<1x4x192x1xf16, #ktdp.memory_space<ct_local, ct_id = 22>>, memref<1x4x192x1xf16, #ktdp.memory_space<ct_local, ct_id = 23>>, memref<1x4x192x1xf16, #ktdp.memory_space<ct_local, ct_id = 24>>, memref<1x4x192x1xf16, #ktdp.memory_space<ct_local, ct_id = 25>>, memref<1x4x192x1xf16, #ktdp.memory_space<ct_local, ct_id = 26>>, memref<1x4x192x1xf16, #ktdp.memory_space<ct_local, ct_id = 27>>, memref<1x4x192x1xf16, #ktdp.memory_space<ct_local, ct_id = 28>>, memref<1x4x192x1xf16, #ktdp.memory_space<ct_local, ct_id = 29>>, memref<1x4x192x1xf16, #ktdp.memory_space<ct_local, ct_id = 3>>, memref<1x4x192x1xf16, #ktdp.memory_space<ct_local, ct_id = 30>>, memref<1x4x192x1xf16, #ktdp.memory_space<ct_local, ct_id = 31>>, memref<1x4x192x1xf16, #ktdp.memory_space<ct_local, ct_id = 4>>, memref<1x4x192x1xf16, #ktdp.memory_space<ct_local, ct_id = 5>>, memref<1x4x192x1xf16, #ktdp.memory_space<ct_local, ct_id = 6>>, memref<1x4x192x1xf16, #ktdp.memory_space<ct_local, ct_id = 7>>, memref<1x4x192x1xf16, #ktdp.memory_space<ct_local, ct_id = 8>>, memref<1x4x192x1xf16, #ktdp.memory_space<ct_local, ct_id = 9>>) : memref<1x32x768x1xf16>
 
   // The destination distribution, the same way. A piece with several owners
-  // is that many views with the SAME coordinate_set and different ct_id --
-  // which is what replication is, stated rather than left to the launch. The
-  // composed type counts those views, so the slots are distinct coordinates
-  // and no coordinate has two writers.
+  // is that many views, one per owner, each a distinct SLOT of the composed
+  // view: the slots of one piece stack on dimension 0, so their coordinate
+  // sets are disjoint and no coordinate has two writers. Coordinates are the
+  // composed view's own, starting at 0.
   %d0 = ktdp.construct_memory_view %dst, sizes: [1, 4, 768, 1], strides: [3072, 768, 1, 1]
       {coordinate_set = #dst0, memory_space = #ktdp.memory_space<ct_local, ct_id = 0>}
       : memref<1x4x768x1xf16, #ktdp.memory_space<ct_local, ct_id = 0>>
@@ -207,18 +206,24 @@ func.func @c022_decode_sum_input0(%src: index, %dst: index) {
   %i_mb = arith.remsi %q_mb, %c8 : index
   %o_mb = arith.muli %i_mb, %c4 : index
 
-  // The movement, and no control flow: one load of a coordinate REGION --
-  // which source partitions that touches is the composed view's to resolve,
-  // and a region may span several -- and one store into a named slot of the
-  // destination, whose ct_id is what says whether this core owns it.
-  %rt = ktdp.construct_access_tile %from[%c0, %o_mb, %c0, %c0]
-      {access_tile_order = #ord0, access_tile_set = #dst0}
-      : memref<1x32x768x1xf16> -> !ktdp.access_tile<1x4x768x1xindex>
-  %val = ktdp.load %rt : <1x4x768x1xindex> -> tensor<1x4x768x1xf16>
-  %wt = ktdp.construct_access_tile %to[%c0, %o_mb, %c0, %c0]
-      {access_tile_order = #ord0, access_tile_set = #dst0}
-      : memref<1x32x768x1xf16> -> !ktdp.access_tile<1x4x768x1xindex>
-  ktdp.store %val, %wt : tensor<1x4x768x1xf16>, <1x4x768x1xindex>
+  // The movement: one load of a coordinate REGION -- which source partitions
+  // that touches is the composed view's to resolve, and a region may span
+  // several -- and one store into this core's own slot of the destination.
+  %r = arith.remsi %tid, %c4 : index
+  %part = arith.cmpi eq, %r, %c0 : index
+  // Not every core owns a slot. The function is SPMD, so without the guard a
+  // core that owns none would store into another core's slot: a remote write.
+  // The load is guarded with the store, since it IS the transfer.
+  scf.if %part {
+    %rt = ktdp.construct_access_tile %from[%c0, %o_mb, %c0, %c0]
+        {access_tile_order = #ord0, access_tile_set = #dst0}
+        : memref<1x32x768x1xf16> -> !ktdp.access_tile<1x4x768x1xindex>
+    %val = ktdp.load %rt : <1x4x768x1xindex> -> tensor<1x4x768x1xf16>
+    %wt = ktdp.construct_access_tile %to[%c0, %o_mb, %c0, %c0]
+        {access_tile_order = #ord0, access_tile_set = #dst0}
+        : memref<1x32x768x1xf16> -> !ktdp.access_tile<1x4x768x1xindex>
+    ktdp.store %val, %wt : tensor<1x4x768x1xf16>, <1x4x768x1xindex>
+  }
 
   return
 }

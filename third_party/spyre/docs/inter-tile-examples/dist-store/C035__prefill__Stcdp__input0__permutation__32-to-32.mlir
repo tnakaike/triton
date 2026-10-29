@@ -7,14 +7,12 @@
 // composed    source 512x4096x1, destination 1x4096x1 = 1x4096x1 x 1 slot(s) per piece
 //
 // Both sides composed, so the function states the whole movement and needs no
-// launch table to be read. The destination view is the whole of what its views
-// hold -- one slot per (piece, owner) -- so a core says which slot it writes:
+// launch table to be read. The destination is a global view of disjoint
+// slots, one per (piece, owner), so a core says which slot it writes:
 //     mb = 511
 //     out = ((tid // 1) % 32) * 128
 //     y = 0
-// Which cores take part is not stated: 32 of the 32 address a slot they
-// own, and the slot's own ct_id is what says so. See README.md for the mapping
-// and the provenance.
+// Every core owns a slot. See README.md for the mapping and the provenance.
 
 #src0 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 1023 >= 0, d2 >= 0, -d2 >= 0)>
 #src1 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 63 >= 0, d1 - 1024 >= 0, -d1 + 2047 >= 0, d2 >= 0, -d2 >= 0)>
@@ -48,39 +46,38 @@
 #src29 = affine_set<(d0, d1, d2) : (d0 - 64 >= 0, -d0 + 127 >= 0, d1 - 3072 >= 0, -d1 + 4095 >= 0, d2 >= 0, -d2 >= 0)>
 #src30 = affine_set<(d0, d1, d2) : (d0 - 128 >= 0, -d0 + 191 >= 0, d1 >= 0, -d1 + 1023 >= 0, d2 >= 0, -d2 >= 0)>
 #src31 = affine_set<(d0, d1, d2) : (d0 - 128 >= 0, -d0 + 191 >= 0, d1 - 1024 >= 0, -d1 + 2047 >= 0, d2 >= 0, -d2 >= 0)>
-#dst0 = affine_set<(d0, d1, d2) : (d0 - 511 >= 0, -d0 + 511 >= 0, d1 >= 0, -d1 + 127 >= 0, d2 >= 0, -d2 >= 0)>
-#dst1 = affine_set<(d0, d1, d2) : (d0 - 511 >= 0, -d0 + 511 >= 0, d1 - 128 >= 0, -d1 + 255 >= 0, d2 >= 0, -d2 >= 0)>
-#dst2 = affine_set<(d0, d1, d2) : (d0 - 511 >= 0, -d0 + 511 >= 0, d1 - 1280 >= 0, -d1 + 1407 >= 0, d2 >= 0, -d2 >= 0)>
-#dst3 = affine_set<(d0, d1, d2) : (d0 - 511 >= 0, -d0 + 511 >= 0, d1 - 1408 >= 0, -d1 + 1535 >= 0, d2 >= 0, -d2 >= 0)>
-#dst4 = affine_set<(d0, d1, d2) : (d0 - 511 >= 0, -d0 + 511 >= 0, d1 - 1536 >= 0, -d1 + 1663 >= 0, d2 >= 0, -d2 >= 0)>
-#dst5 = affine_set<(d0, d1, d2) : (d0 - 511 >= 0, -d0 + 511 >= 0, d1 - 1664 >= 0, -d1 + 1791 >= 0, d2 >= 0, -d2 >= 0)>
-#dst6 = affine_set<(d0, d1, d2) : (d0 - 511 >= 0, -d0 + 511 >= 0, d1 - 1792 >= 0, -d1 + 1919 >= 0, d2 >= 0, -d2 >= 0)>
-#dst7 = affine_set<(d0, d1, d2) : (d0 - 511 >= 0, -d0 + 511 >= 0, d1 - 1920 >= 0, -d1 + 2047 >= 0, d2 >= 0, -d2 >= 0)>
-#dst8 = affine_set<(d0, d1, d2) : (d0 - 511 >= 0, -d0 + 511 >= 0, d1 - 2048 >= 0, -d1 + 2175 >= 0, d2 >= 0, -d2 >= 0)>
-#dst9 = affine_set<(d0, d1, d2) : (d0 - 511 >= 0, -d0 + 511 >= 0, d1 - 2176 >= 0, -d1 + 2303 >= 0, d2 >= 0, -d2 >= 0)>
-#dst10 = affine_set<(d0, d1, d2) : (d0 - 511 >= 0, -d0 + 511 >= 0, d1 - 2304 >= 0, -d1 + 2431 >= 0, d2 >= 0, -d2 >= 0)>
-#dst11 = affine_set<(d0, d1, d2) : (d0 - 511 >= 0, -d0 + 511 >= 0, d1 - 2432 >= 0, -d1 + 2559 >= 0, d2 >= 0, -d2 >= 0)>
-#dst12 = affine_set<(d0, d1, d2) : (d0 - 511 >= 0, -d0 + 511 >= 0, d1 - 256 >= 0, -d1 + 383 >= 0, d2 >= 0, -d2 >= 0)>
-#dst13 = affine_set<(d0, d1, d2) : (d0 - 511 >= 0, -d0 + 511 >= 0, d1 - 2560 >= 0, -d1 + 2687 >= 0, d2 >= 0, -d2 >= 0)>
-#dst14 = affine_set<(d0, d1, d2) : (d0 - 511 >= 0, -d0 + 511 >= 0, d1 - 2688 >= 0, -d1 + 2815 >= 0, d2 >= 0, -d2 >= 0)>
-#dst15 = affine_set<(d0, d1, d2) : (d0 - 511 >= 0, -d0 + 511 >= 0, d1 - 2816 >= 0, -d1 + 2943 >= 0, d2 >= 0, -d2 >= 0)>
-#dst16 = affine_set<(d0, d1, d2) : (d0 - 511 >= 0, -d0 + 511 >= 0, d1 - 2944 >= 0, -d1 + 3071 >= 0, d2 >= 0, -d2 >= 0)>
-#dst17 = affine_set<(d0, d1, d2) : (d0 - 511 >= 0, -d0 + 511 >= 0, d1 - 3072 >= 0, -d1 + 3199 >= 0, d2 >= 0, -d2 >= 0)>
-#dst18 = affine_set<(d0, d1, d2) : (d0 - 511 >= 0, -d0 + 511 >= 0, d1 - 3200 >= 0, -d1 + 3327 >= 0, d2 >= 0, -d2 >= 0)>
-#dst19 = affine_set<(d0, d1, d2) : (d0 - 511 >= 0, -d0 + 511 >= 0, d1 - 3328 >= 0, -d1 + 3455 >= 0, d2 >= 0, -d2 >= 0)>
-#dst20 = affine_set<(d0, d1, d2) : (d0 - 511 >= 0, -d0 + 511 >= 0, d1 - 3456 >= 0, -d1 + 3583 >= 0, d2 >= 0, -d2 >= 0)>
-#dst21 = affine_set<(d0, d1, d2) : (d0 - 511 >= 0, -d0 + 511 >= 0, d1 - 3584 >= 0, -d1 + 3711 >= 0, d2 >= 0, -d2 >= 0)>
-#dst22 = affine_set<(d0, d1, d2) : (d0 - 511 >= 0, -d0 + 511 >= 0, d1 - 3712 >= 0, -d1 + 3839 >= 0, d2 >= 0, -d2 >= 0)>
-#dst23 = affine_set<(d0, d1, d2) : (d0 - 511 >= 0, -d0 + 511 >= 0, d1 - 384 >= 0, -d1 + 511 >= 0, d2 >= 0, -d2 >= 0)>
-#dst24 = affine_set<(d0, d1, d2) : (d0 - 511 >= 0, -d0 + 511 >= 0, d1 - 3840 >= 0, -d1 + 3967 >= 0, d2 >= 0, -d2 >= 0)>
-#dst25 = affine_set<(d0, d1, d2) : (d0 - 511 >= 0, -d0 + 511 >= 0, d1 - 3968 >= 0, -d1 + 4095 >= 0, d2 >= 0, -d2 >= 0)>
-#dst26 = affine_set<(d0, d1, d2) : (d0 - 511 >= 0, -d0 + 511 >= 0, d1 - 512 >= 0, -d1 + 639 >= 0, d2 >= 0, -d2 >= 0)>
-#dst27 = affine_set<(d0, d1, d2) : (d0 - 511 >= 0, -d0 + 511 >= 0, d1 - 640 >= 0, -d1 + 767 >= 0, d2 >= 0, -d2 >= 0)>
-#dst28 = affine_set<(d0, d1, d2) : (d0 - 511 >= 0, -d0 + 511 >= 0, d1 - 768 >= 0, -d1 + 895 >= 0, d2 >= 0, -d2 >= 0)>
-#dst29 = affine_set<(d0, d1, d2) : (d0 - 511 >= 0, -d0 + 511 >= 0, d1 - 896 >= 0, -d1 + 1023 >= 0, d2 >= 0, -d2 >= 0)>
-#dst30 = affine_set<(d0, d1, d2) : (d0 - 511 >= 0, -d0 + 511 >= 0, d1 - 1024 >= 0, -d1 + 1151 >= 0, d2 >= 0, -d2 >= 0)>
-#dst31 = affine_set<(d0, d1, d2) : (d0 - 511 >= 0, -d0 + 511 >= 0, d1 - 1152 >= 0, -d1 + 1279 >= 0, d2 >= 0, -d2 >= 0)>
-#blk0 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 127 >= 0, d2 >= 0, -d2 >= 0)>
+#dst0 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 127 >= 0, d2 >= 0, -d2 >= 0)>
+#dst1 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 - 128 >= 0, -d1 + 255 >= 0, d2 >= 0, -d2 >= 0)>
+#dst2 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 - 1280 >= 0, -d1 + 1407 >= 0, d2 >= 0, -d2 >= 0)>
+#dst3 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 - 1408 >= 0, -d1 + 1535 >= 0, d2 >= 0, -d2 >= 0)>
+#dst4 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 - 1536 >= 0, -d1 + 1663 >= 0, d2 >= 0, -d2 >= 0)>
+#dst5 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 - 1664 >= 0, -d1 + 1791 >= 0, d2 >= 0, -d2 >= 0)>
+#dst6 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 - 1792 >= 0, -d1 + 1919 >= 0, d2 >= 0, -d2 >= 0)>
+#dst7 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 - 1920 >= 0, -d1 + 2047 >= 0, d2 >= 0, -d2 >= 0)>
+#dst8 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 - 2048 >= 0, -d1 + 2175 >= 0, d2 >= 0, -d2 >= 0)>
+#dst9 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 - 2176 >= 0, -d1 + 2303 >= 0, d2 >= 0, -d2 >= 0)>
+#dst10 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 - 2304 >= 0, -d1 + 2431 >= 0, d2 >= 0, -d2 >= 0)>
+#dst11 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 - 2432 >= 0, -d1 + 2559 >= 0, d2 >= 0, -d2 >= 0)>
+#dst12 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 - 256 >= 0, -d1 + 383 >= 0, d2 >= 0, -d2 >= 0)>
+#dst13 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 - 2560 >= 0, -d1 + 2687 >= 0, d2 >= 0, -d2 >= 0)>
+#dst14 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 - 2688 >= 0, -d1 + 2815 >= 0, d2 >= 0, -d2 >= 0)>
+#dst15 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 - 2816 >= 0, -d1 + 2943 >= 0, d2 >= 0, -d2 >= 0)>
+#dst16 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 - 2944 >= 0, -d1 + 3071 >= 0, d2 >= 0, -d2 >= 0)>
+#dst17 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 - 3072 >= 0, -d1 + 3199 >= 0, d2 >= 0, -d2 >= 0)>
+#dst18 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 - 3200 >= 0, -d1 + 3327 >= 0, d2 >= 0, -d2 >= 0)>
+#dst19 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 - 3328 >= 0, -d1 + 3455 >= 0, d2 >= 0, -d2 >= 0)>
+#dst20 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 - 3456 >= 0, -d1 + 3583 >= 0, d2 >= 0, -d2 >= 0)>
+#dst21 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 - 3584 >= 0, -d1 + 3711 >= 0, d2 >= 0, -d2 >= 0)>
+#dst22 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 - 3712 >= 0, -d1 + 3839 >= 0, d2 >= 0, -d2 >= 0)>
+#dst23 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 - 384 >= 0, -d1 + 511 >= 0, d2 >= 0, -d2 >= 0)>
+#dst24 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 - 3840 >= 0, -d1 + 3967 >= 0, d2 >= 0, -d2 >= 0)>
+#dst25 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 - 3968 >= 0, -d1 + 4095 >= 0, d2 >= 0, -d2 >= 0)>
+#dst26 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 - 512 >= 0, -d1 + 639 >= 0, d2 >= 0, -d2 >= 0)>
+#dst27 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 - 640 >= 0, -d1 + 767 >= 0, d2 >= 0, -d2 >= 0)>
+#dst28 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 - 768 >= 0, -d1 + 895 >= 0, d2 >= 0, -d2 >= 0)>
+#dst29 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 - 896 >= 0, -d1 + 1023 >= 0, d2 >= 0, -d2 >= 0)>
+#dst30 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 - 1024 >= 0, -d1 + 1151 >= 0, d2 >= 0, -d2 >= 0)>
+#dst31 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 - 1152 >= 0, -d1 + 1279 >= 0, d2 >= 0, -d2 >= 0)>
 #ord0 = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
 
 func.func @c035_prefill_stcdp_input0(%src: index, %dst: index) {
@@ -194,10 +191,10 @@ func.func @c035_prefill_stcdp_input0(%src: index, %dst: index) {
       : memref<64x1024x1xf16, #ktdp.memory_space<ct_local, ct_id = 0>>, memref<64x1024x1xf16, #ktdp.memory_space<ct_local, ct_id = 1>>, memref<64x1024x1xf16, #ktdp.memory_space<ct_local, ct_id = 10>>, memref<64x1024x1xf16, #ktdp.memory_space<ct_local, ct_id = 11>>, memref<64x1024x1xf16, #ktdp.memory_space<ct_local, ct_id = 12>>, memref<64x1024x1xf16, #ktdp.memory_space<ct_local, ct_id = 13>>, memref<64x1024x1xf16, #ktdp.memory_space<ct_local, ct_id = 14>>, memref<64x1024x1xf16, #ktdp.memory_space<ct_local, ct_id = 15>>, memref<64x1024x1xf16, #ktdp.memory_space<ct_local, ct_id = 16>>, memref<64x1024x1xf16, #ktdp.memory_space<ct_local, ct_id = 17>>, memref<64x1024x1xf16, #ktdp.memory_space<ct_local, ct_id = 18>>, memref<64x1024x1xf16, #ktdp.memory_space<ct_local, ct_id = 19>>, memref<64x1024x1xf16, #ktdp.memory_space<ct_local, ct_id = 2>>, memref<64x1024x1xf16, #ktdp.memory_space<ct_local, ct_id = 20>>, memref<64x1024x1xf16, #ktdp.memory_space<ct_local, ct_id = 21>>, memref<64x1024x1xf16, #ktdp.memory_space<ct_local, ct_id = 22>>, memref<64x1024x1xf16, #ktdp.memory_space<ct_local, ct_id = 23>>, memref<64x1024x1xf16, #ktdp.memory_space<ct_local, ct_id = 24>>, memref<64x1024x1xf16, #ktdp.memory_space<ct_local, ct_id = 25>>, memref<64x1024x1xf16, #ktdp.memory_space<ct_local, ct_id = 26>>, memref<64x1024x1xf16, #ktdp.memory_space<ct_local, ct_id = 27>>, memref<64x1024x1xf16, #ktdp.memory_space<ct_local, ct_id = 28>>, memref<64x1024x1xf16, #ktdp.memory_space<ct_local, ct_id = 29>>, memref<64x1024x1xf16, #ktdp.memory_space<ct_local, ct_id = 3>>, memref<64x1024x1xf16, #ktdp.memory_space<ct_local, ct_id = 30>>, memref<64x1024x1xf16, #ktdp.memory_space<ct_local, ct_id = 31>>, memref<64x1024x1xf16, #ktdp.memory_space<ct_local, ct_id = 4>>, memref<64x1024x1xf16, #ktdp.memory_space<ct_local, ct_id = 5>>, memref<64x1024x1xf16, #ktdp.memory_space<ct_local, ct_id = 6>>, memref<64x1024x1xf16, #ktdp.memory_space<ct_local, ct_id = 7>>, memref<64x1024x1xf16, #ktdp.memory_space<ct_local, ct_id = 8>>, memref<64x1024x1xf16, #ktdp.memory_space<ct_local, ct_id = 9>>) : memref<512x4096x1xf16>
 
   // The destination distribution, the same way. A piece with several owners
-  // is that many views with the SAME coordinate_set and different ct_id --
-  // which is what replication is, stated rather than left to the launch. The
-  // composed type counts those views, so the slots are distinct coordinates
-  // and no coordinate has two writers.
+  // is that many views, one per owner, each a distinct SLOT of the composed
+  // view: the slots of one piece stack on dimension 0, so their coordinate
+  // sets are disjoint and no coordinate has two writers. Coordinates are the
+  // composed view's own, starting at 0.
   %d0 = ktdp.construct_memory_view %dst, sizes: [1, 128, 1], strides: [128, 1, 1]
       {coordinate_set = #dst0, memory_space = #ktdp.memory_space<ct_local, ct_id = 0>}
       : memref<1x128x1xf16, #ktdp.memory_space<ct_local, ct_id = 0>>
@@ -304,16 +301,15 @@ func.func @c035_prefill_stcdp_input0(%src: index, %dst: index) {
   %i_out = arith.remsi %tid, %c32 : index
   %o_out = arith.muli %i_out, %c128 : index
 
-  // The movement, and no control flow: one load of a coordinate REGION --
-  // which source partitions that touches is the composed view's to resolve,
-  // and a region may span several -- and one store into a named slot of the
-  // destination, whose ct_id is what says whether this core owns it.
+  // The movement: one load of a coordinate REGION -- which source partitions
+  // that touches is the composed view's to resolve, and a region may span
+  // several -- and one store into this core's own slot of the destination.
   %rt = ktdp.construct_access_tile %from[%c511, %o_out, %c0]
-      {access_tile_order = #ord0, access_tile_set = #blk0}
+      {access_tile_order = #ord0, access_tile_set = #dst0}
       : memref<512x4096x1xf16> -> !ktdp.access_tile<1x128x1xindex>
   %val = ktdp.load %rt : <1x128x1xindex> -> tensor<1x128x1xf16>
   %wt = ktdp.construct_access_tile %to[%c0, %o_out, %c0]
-      {access_tile_order = #ord0, access_tile_set = #blk0}
+      {access_tile_order = #ord0, access_tile_set = #dst0}
       : memref<1x4096x1xf16> -> !ktdp.access_tile<1x128x1xindex>
   ktdp.store %val, %wt : tensor<1x128x1xf16>, <1x128x1xindex>
 
