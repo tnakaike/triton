@@ -280,9 +280,10 @@ def emit_dist(row, rec):
     the union of its views' coordinate sets, so `R` owners of one piece are `R`
     distinct slots stacked on dimension 0, each view's coordinate set naming its
     own slot, in the composed view's coordinates (origin at the union's lower
-    corner). C002's destination is the whole 4096-element tensor held by 16 cores,
-    so its composed type is `memref<65536x1x1xf16>`, and its 16 views cover
-    `[0, 4096)`, `[4096, 8192)`, ... on dimension 0.
+    corner). All of it is in the record's physical layout (`physicalize`). C002's
+    destination is the whole tensor, physically `[1, 64, 1, 64]`, held by 16
+    cores, so its composed type is `memref<16x64x1x64xf16>`, and its 16 views
+    cover `y = 0`, `y = 1`, ... on dimension 0.
 
     That is what puts the tile id in this spelling: a store has to say WHICH slot
     -- the piece from the same fields of the tile id `if-store` uses, and the
@@ -798,26 +799,43 @@ def readme(records, form):
         A("")
         A("| Source record | KTIR |")
         A("|---|---|")
-        A("| a piece\'s `start` and `size` | the `coordinate_set`, as a box of that size, placed where the view sits in the composed view (below) |")
+        A("| the SDSC\'s `layoutDimOrder_`, `stickDimOrder_`, `dimToStickSize_` | the **physical** dimension order every view, access tile and index uses (below) |")
+        A("| a piece\'s `start` and `size` | the `coordinate_set`, as that box in physical coordinates, placed where the view sits in the composed view |")
         A("| each of that piece\'s `owners` | one view per owner, `memory_space = #ktdp.memory_space<ct_local, ct_id = N>`, repeated in the result memref type |")
         A("| a side\'s pieces and their owners | that side\'s composed result shape: the box the pieces tile, with dimension 0 scaled by the number of owners each piece has |")
         A("| `word_length` | the element type: 2 bytes, so `f16` throughout |")
+        A("")
+        A("**Every file is in the physical layout its SDSC states**, the form")
+        A("`RewriteDescriptorLayout` gives a memory view: physical sizes, row-major")
+        A("strides, and coordinate sets and access tiles in the same physical index space.")
+        A("`layoutDimOrder_` lists the dimensions innermost first -- torch-spyre writes it")
+        A("from `_get_device_dim_order` (`_inductor/codegen/superdsc.py`), which walks the")
+        A("device coordinates from the last non-lane dimension back -- so the physical")
+        A("order, outermost first, is its reverse. The stick dimension `s` is split the way")
+        A("`SpyreTensorLayout` splits it: its outer part, `size / 64`, keeps `s`\'s place and")
+        A("name, and its 64 lanes are appended last as `s%`. C001 is `[mb, in, y]` logically")
+        A("and `layoutDimOrder_ [mb, in, y]` with stick `in`, so physically")
+        A("`(y, in, mb, in%) = [1, 200, 1, 64]`. Every piece in the 35 is stick-aligned,")
+        A("which the generator asserts, so a piece\'s range on `s` is a range of whole sticks.")
+        A("Both sides of one record share one layout in all 35.")
         A("")
         A("**A composed view is a global view of disjoint slots.** Its domain is the union")
         A("of its views\' coordinate sets, so every coordinate has exactly one view, and the")
         A("coordinate sets are written in the composed view\'s own coordinates. The rule is")
         A("one sentence -- every `(piece, owner)` pair is a slot of the result, and the")
-        A("slots of one piece stack on dimension 0 -- and two of the 35 show what it decides:")
+        A("slots of one piece stack on physical dimension 0 -- and two of the 35 show what")
+        A("it decides:")
         A("")
-        A("- **Replication multiplies.** C002\'s destination is the whole 4096-element")
-        A("  tensor held by 16 cores, so its composed type is `memref<65536x1x1xf16>` and")
-        A("  its 16 views cover `[0, 4096)`, `[4096, 8192)`, ... on dimension 0. The 16")
-        A("  copies are real memory and each is its own slot, so no coordinate has two")
-        A("  views and none has two writers.")
+        A("- **Replication multiplies.** C002\'s destination is the whole tensor held by 16")
+        A("  cores. Physically that tensor is `(y, in, mb, in%) = [1, 64, 1, 64]`, so its")
+        A("  composed type is `memref<16x64x1x64xf16>` and its 16 views cover `y = 0`,")
+        A("  `y = 1`, ... The 16 copies are real memory and each is its own slot, so no")
+        A("  coordinate has two views and none has two writers.")
         A("- **A side need not cover the tensor.** C035\'s destination pieces all sit at")
-        A("  `mb = 511`, so the box they tile is `1x4096x1` -- one row of 512 -- and that is")
-        A("  its composed extent. The coordinate sets are shifted to that box\'s origin, so")
-        A("  they say `mb = 0` where the record says 511: the composed view starts at 0.")
+        A("  `mb = 511`, so the box they tile is one row of 512: physically")
+        A("  `(y, out, mb, out%) = [1, 64, 1, 64]`, and that is its composed extent. The")
+        A("  coordinate sets are shifted to that box\'s origin, so they say `mb = 0` where")
+        A("  the record says 511: the composed view starts at 0.")
         A("")
         A("The source side needs neither rule in these 35: every source piece has one owner,")
         A("and every source side covers the tensor from the origin, so its coordinate sets")
@@ -832,8 +850,11 @@ def readme(records, form):
         A("")
         A("**One `%src` and one `%dst`.** The design requires the views on a side to differ")
         A("*only* in `coordinate_set` and `ct_id`, which means one address, at the same place")
-        A("in each core\'s scratchpad. The capture carries no LX addresses, so these are")
-        A("`index` arguments rather than invented constants.")
+        A("in each core\'s scratchpad, and these files pass it as an `index` argument. The")
+        A("SDSC does record the real per-core LX address, `lxStartAddress_`, and on 57 of")
+        A("the 70 sides it is one address on every core. On the other 13 it is not -- C002\'s")
+        A("source puts core 0 at 512 and the other 31 at 768 -- so for those the single")
+        A("argument stands for a placement the record does not have.")
         A("")
         A("**`access_tile_set` is a range over the block shape**, not the box in global")
         A("coordinates. `buildAccessTile`")
@@ -922,8 +943,9 @@ def readme(records, form):
         A("")
         A("**The composed destination is a global view of disjoint slots.** Every")
         A("*(piece, owner)* pair is a slot of the result and the slots of one piece stack on")
-        A("dimension 0, so C002 -- the whole 4096-element tensor on 16 cores -- composes to")
-        A("`memref<65536x1x1xf16>`, its 16 views covering `[0, 4096)`, `[4096, 8192)`, ...")
+        A("physical dimension 0, so C002 -- the whole tensor, physically `[1, 64, 1, 64]`,")
+        A("on 16 cores -- composes to `memref<16x64x1x64xf16>`, its 16 views covering")
+        A("`y = 0`, `y = 1`, ...")
         A("[The parent README](../README.md) states the rule and the other case it decides,")
         A("C035, whose destination covers one row of 512.")
         A("")
@@ -1049,6 +1071,80 @@ def readme(records, form):
     return "\n".join(L) + "\n"
 
 
+def sdsc_layout(sdsc):
+    """The one layout both sides of a curated record share, read from its SDSC.
+
+    Each curated SDSC has two labeled data structures, the relayout's source and
+    destination; in all 35 they carry the same `layoutDimOrder_`, `stickDimOrder_`
+    and `dimToStickSize_`, which this asserts rather than assumes.
+    """
+    found = []
+
+    def walk(o):
+        if isinstance(o, dict):
+            if "layoutDimOrder_" in o:
+                found.append(o)
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+
+    walk(sdsc)
+    assert len(found) == 2, len(found)
+    src, dst = found
+    for k in ("layoutDimOrder_", "stickDimOrder_", "dimToStickSize_"):
+        assert src[k] == dst[k], (k, src[k], dst[k])
+    assert len(src["stickDimOrder_"]) == 1, src["stickDimOrder_"]
+    stick = src["stickDimOrder_"][0]
+    return list(src["layoutDimOrder_"]), stick, src["dimToStickSize_"][stick]
+
+
+def physicalize(rec, layout):
+    """Rewrite a record's pieces and extents into the PHYSICAL layout.
+
+    `layoutDimOrder_` runs innermost to outermost -- torch-spyre writes it from
+    `_get_device_dim_order` (`_inductor/codegen/superdsc.py`), which walks the
+    device coordinates from the last non-lane dim back to the first -- so the
+    physical order, outermost first, is its reverse. The stick dim `s` is split
+    the way `SpyreTensorLayout` splits it: its outer part, `ceil(size / S)`, stays
+    at `s`'s place in that order and keeps its name, and its lanes, `S` wide, are
+    appended last as `s%`. This is the form `RewriteDescriptorLayout` gives a
+    memory view: physical sizes, row-major strides, and `coordinate_set`s and
+    access tiles in the same physical index space.
+
+    A piece maps dim by dim. Every piece in the 35 is stick-aligned on `s`, which
+    is asserted, so `[start, start + size)` on `s` is the outer range
+    `[start / S, (start + size) / S)` and the lanes are whole: `[0, S)`.
+    """
+    order, stick, S = layout
+    phys = list(reversed(order)) + [stick + "%"]
+    assert set(order) == set(rec["source_extents"]), (order, rec["source_extents"])
+
+    def ext(extents):
+        out = {k: extents[k] for k in phys[:-1]}
+        out[stick] = -(-extents[stick] // S)
+        out[stick + "%"] = S
+        return out
+
+    def piece(p):
+        st, sz = p["start"][stick], p["size"][stick]
+        assert st % S == 0 and sz % S == 0, (rec["relayout"], p["key"], st, sz)
+        start = {k: p["start"][k] for k in phys[:-1]}
+        size = {k: p["size"][k] for k in phys[:-1]}
+        start[stick], size[stick] = st // S, sz // S
+        start[stick + "%"], size[stick + "%"] = 0, S
+        return dict(p, start=start, size=size)
+
+    out = dict(rec)
+    out["source_extents"] = ext(rec["source_extents"])
+    out["destination_extents"] = ext(rec["destination_extents"])
+    out["source_pieces"] = [piece(p) for p in rec["source_pieces"]]
+    out["destination_pieces"] = [piece(p) for p in rec["destination_pieces"]]
+    out["layout"] = {"order": phys, "stick": stick, "stick_size": S}
+    return out
+
+
 def main(argv):
     pkg = pathlib.Path(argv[1]) if len(argv) > 1 else DEFAULT_PKG
     out = pathlib.Path(argv[2]) if len(argv) > 2 else DEFAULT_OUT
@@ -1078,6 +1174,10 @@ def main(argv):
             assert list(p["start"]) == keys and list(p["size"]) == keys, row["curated_id"]
         for p in rec["source_pieces"]:
             assert len(p["owners"]) == 1, (row["curated_id"], p["key"])
+
+        # Everything below is in the physical layout the record's own SDSC states.
+        sdsc = json.load(open(pkg / "curated" / row["curated_file"]))
+        rec = physicalize(rec, sdsc_layout(sdsc))
 
         name = row["curated_file"][:-5] + ".mlir"
         (dist_dir / name).write_text(emit_dist(row, rec))

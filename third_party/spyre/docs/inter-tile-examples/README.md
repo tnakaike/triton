@@ -52,26 +52,43 @@ are chosen to isolate one question at a time; these are whatever a real model di
 
 | Source record | KTIR |
 |---|---|
-| a piece's `start` and `size` | the `coordinate_set`, as a box of that size, placed where the view sits in the composed view (below) |
+| the SDSC's `layoutDimOrder_`, `stickDimOrder_`, `dimToStickSize_` | the **physical** dimension order every view, access tile and index uses (below) |
+| a piece's `start` and `size` | the `coordinate_set`, as that box in physical coordinates, placed where the view sits in the composed view |
 | each of that piece's `owners` | one view per owner, `memory_space = #ktdp.memory_space<ct_local, ct_id = N>`, repeated in the result memref type |
 | a side's pieces and their owners | that side's composed result shape: the box the pieces tile, with dimension 0 scaled by the number of owners each piece has |
 | `word_length` | the element type: 2 bytes, so `f16` throughout |
+
+**Every file is in the physical layout its SDSC states**, the form
+`RewriteDescriptorLayout` gives a memory view: physical sizes, row-major
+strides, and coordinate sets and access tiles in the same physical index space.
+`layoutDimOrder_` lists the dimensions innermost first -- torch-spyre writes it
+from `_get_device_dim_order` (`_inductor/codegen/superdsc.py`), which walks the
+device coordinates from the last non-lane dimension back -- so the physical
+order, outermost first, is its reverse. The stick dimension `s` is split the way
+`SpyreTensorLayout` splits it: its outer part, `size / 64`, keeps `s`'s place and
+name, and its 64 lanes are appended last as `s%`. C001 is `[mb, in, y]` logically
+and `layoutDimOrder_ [mb, in, y]` with stick `in`, so physically
+`(y, in, mb, in%) = [1, 200, 1, 64]`. Every piece in the 35 is stick-aligned,
+which the generator asserts, so a piece's range on `s` is a range of whole sticks.
+Both sides of one record share one layout in all 35.
 
 **A composed view is a global view of disjoint slots.** Its domain is the union
 of its views' coordinate sets, so every coordinate has exactly one view, and the
 coordinate sets are written in the composed view's own coordinates. The rule is
 one sentence -- every `(piece, owner)` pair is a slot of the result, and the
-slots of one piece stack on dimension 0 -- and two of the 35 show what it decides:
+slots of one piece stack on physical dimension 0 -- and two of the 35 show what
+it decides:
 
-- **Replication multiplies.** C002's destination is the whole 4096-element
-  tensor held by 16 cores, so its composed type is `memref<65536x1x1xf16>` and
-  its 16 views cover `[0, 4096)`, `[4096, 8192)`, ... on dimension 0. The 16
-  copies are real memory and each is its own slot, so no coordinate has two
-  views and none has two writers.
+- **Replication multiplies.** C002's destination is the whole tensor held by 16
+  cores. Physically that tensor is `(y, in, mb, in%) = [1, 64, 1, 64]`, so its
+  composed type is `memref<16x64x1x64xf16>` and its 16 views cover `y = 0`,
+  `y = 1`, ... The 16 copies are real memory and each is its own slot, so no
+  coordinate has two views and none has two writers.
 - **A side need not cover the tensor.** C035's destination pieces all sit at
-  `mb = 511`, so the box they tile is `1x4096x1` -- one row of 512 -- and that is
-  its composed extent. The coordinate sets are shifted to that box's origin, so
-  they say `mb = 0` where the record says 511: the composed view starts at 0.
+  `mb = 511`, so the box they tile is one row of 512: physically
+  `(y, out, mb, out%) = [1, 64, 1, 64]`, and that is its composed extent. The
+  coordinate sets are shifted to that box's origin, so they say `mb = 0` where
+  the record says 511: the composed view starts at 0.
 
 The source side needs neither rule in these 35: every source piece has one owner,
 and every source side covers the tensor from the origin, so its coordinate sets
@@ -86,8 +103,11 @@ Three conventions the source record does not dictate:
 
 **One `%src` and one `%dst`.** The design requires the views on a side to differ
 *only* in `coordinate_set` and `ct_id`, which means one address, at the same place
-in each core's scratchpad. The capture carries no LX addresses, so these are
-`index` arguments rather than invented constants.
+in each core's scratchpad, and these files pass it as an `index` argument. The
+SDSC does record the real per-core LX address, `lxStartAddress_`, and on 57 of
+the 70 sides it is one address on every core. On the other 13 it is not -- C002's
+source puts core 0 at 512 and the other 31 at 768 -- so for those the single
+argument stands for a placement the record does not have.
 
 **`access_tile_set` is a range over the block shape**, not the box in global
 coordinates. `buildAccessTile`
@@ -118,41 +138,41 @@ everywhere, up to all 32 cores holding the whole tensor.
 
 | ID | Phase | Route class | Pieces | Rank | Consumer | Tensor |
 |---|---|---|---:|---:|---|---|
-| C001 ([dist](dist-store/C001__decode__BatchMatMulV2__input0__grouped_all_gather_with_replication__25-to-1.mlir), [if](if-store/C001__decode__BatchMatMulV2__input0__grouped_all_gather_with_replication__25-to-1.mlir)) | decode | `grouped_all_gather_with_replication` | 25 -> 1 | 3 | mm_13-BMM_1 | mul_263_out |
-| C002 ([dist](dist-store/C002__decode__BatchMatMulV2__input0__grouped_all_gather_with_replication__32-to-1.mlir), [if](if-store/C002__decode__BatchMatMulV2__input0__grouped_all_gather_with_replication__32-to-1.mlir)) | decode | `grouped_all_gather_with_replication` | 32 -> 1 | 3 | mm_1-BMM_1 | mean-LayerNormNorm_out |
-| C003 ([dist](dist-store/C003__decode__BatchMatMulV2__input0__grouped_all_gather_with_replication__32-to-1.mlir), [if](if-store/C003__decode__BatchMatMulV2__input0__grouped_all_gather_with_replication__32-to-1.mlir)) | decode | `grouped_all_gather_with_replication` | 32 -> 1 | 3 | mm_11-BMM_1 | mean_3-LayerNormNorm_out |
-| C004 ([dist](dist-store/C004__decode__BatchMatMulV2__input0__grouped_all_gather_with_replication__32-to-1.mlir), [if](if-store/C004__decode__BatchMatMulV2__input0__grouped_all_gather_with_replication__32-to-1.mlir)) | decode | `grouped_all_gather_with_replication` | 32 -> 1 | 3 | mm_280-BMM_1 | mean_80-LayerNormNorm_out |
-| C005 ([dist](dist-store/C005__decode__BatchMatMulV2__input0__grouped_all_gather_with_replication__32-to-1.mlir), [if](if-store/C005__decode__BatchMatMulV2__input0__grouped_all_gather_with_replication__32-to-1.mlir)) | decode | `grouped_all_gather_with_replication` | 32 -> 1 | 3 | mm-BMM_1 | mean-LayerNormNorm_out |
-| C006 ([dist](dist-store/C006__decode__BatchMatMulV2__input0__grouped_all_gather_with_replication__32-to-8.mlir), [if](if-store/C006__decode__BatchMatMulV2__input0__grouped_all_gather_with_replication__32-to-8.mlir)) | decode | `grouped_all_gather_with_replication` | 32 -> 8 | 5 | bmm_2-BMM_1 | bmm_2-actAttnHeadBreak-VirtualReshape_out |
-| C007 ([dist](dist-store/C007__decode__BatchMatMulV2__input0__grouped_all_gather_with_replication__32-to-16.mlir), [if](if-store/C007__decode__BatchMatMulV2__input0__grouped_all_gather_with_replication__32-to-16.mlir)) | decode | `grouped_all_gather_with_replication` | 32 -> 16 | 5 | bmm_3-BMM_1 | bmm_3-actAttnHeadBreak-VirtualReshape_out |
-| C008 ([dist](dist-store/C008__decode__BatchMatMulV2__input1__all_gather__32-to-32.mlir), [if](if-store/C008__decode__BatchMatMulV2__input1__all_gather__32-to-32.mlir)) | decode | `all_gather` | 32 -> 32 | 5 | bmm-BMM_1 | mul_114_out |
-| C009 ([dist](dist-store/C009__decode__BatchMatMulV2__input1__grouped_all_gather_with_replication__32-to-16.mlir), [if](if-store/C009__decode__BatchMatMulV2__input1__grouped_all_gather_with_replication__32-to-16.mlir)) | decode | `grouped_all_gather_with_replication` | 32 -> 16 | 5 | bmm_3-BMM_1 | bmm_3-wtAttnHeadBreak-VirtualReshape_out |
-| C010 ([dist](dist-store/C010__decode__Exx2__input0__all_gather__32-to-1.mlir), [if](if-store/C010__decode__Exx2__input0__all_gather__32-to-1.mlir)) | decode | `all_gather` | 32 -> 1 | 3 | mean-Exx2 | mul_out |
-| C011 ([dist](dist-store/C011__decode__LayerNormNorm__input1__replicate_or_owner_remap__1-to-1.mlir), [if](if-store/C011__decode__LayerNormNorm__input1__replicate_or_owner_remap__1-to-1.mlir)) | decode | `replicate_or_owner_remap` | 1 -> 1 | 3 | mean-LayerNormNorm | mean-Exx2_out |
-| C012 ([dist](dist-store/C012__decode__LayerNormNorm__input2__replicate_or_owner_remap__1-to-1.mlir), [if](if-store/C012__decode__LayerNormNorm__input2__replicate_or_owner_remap__1-to-1.mlir)) | decode | `replicate_or_owner_remap` | 1 -> 1 | 3 | mean-LayerNormNorm | mean-LayerNormScale_out |
-| C013 ([dist](dist-store/C013__decode__Max__input0__all_gather__32-to-8.mlir), [if](if-store/C013__decode__Max__input0__all_gather__32-to-8.mlir)) | decode | `all_gather` | 32 -> 8 | 4 | _safe_softmax-Max | _safe_softmax-Where3-inp0Masking_out |
-| C014 ([dist](dist-store/C014__decode__Mul__input1__grouped_all_gather_with_replication__2-to-1.mlir), [if](if-store/C014__decode__Mul__input1__grouped_all_gather_with_replication__2-to-1.mlir)) | decode | `grouped_all_gather_with_replication` | 2 -> 1 | 6 | mul_138-mul_1 | mul_138-split_2-Ds0_out |
-| C015 ([dist](dist-store/C015__decode__Mul__input1__grouped_all_gather_with_replication__2-to-1.mlir), [if](if-store/C015__decode__Mul__input1__grouped_all_gather_with_replication__2-to-1.mlir)) | decode | `grouped_all_gather_with_replication` | 2 -> 1 | 6 | mul_137-mul_1 | mul_137-split_2-Ds0_out |
-| C016 ([dist](dist-store/C016__decode__Mul__input1__replicate_or_owner_remap__8-to-8.mlir), [if](if-store/C016__decode__Mul__input1__replicate_or_owner_remap__8-to-8.mlir)) | decode | `replicate_or_owner_remap` | 8 -> 8 | 4 | _safe_softmax_1-Mul | _safe_softmax_1-Reciprocal_out |
-| C017 ([dist](dist-store/C017__decode__Restickify__input0__all_gather__32-to-32.mlir), [if](if-store/C017__decode__Restickify__input0__all_gather__32-to-32.mlir)) | decode | `all_gather` | 32 -> 32 | 5 | bmm-wtAttnHeadBreak-VirtualReshape-Output-Restickify | bmm-wtAttnHeadBreak-VirtualReshape_out |
-| C018 ([dist](dist-store/C018__decode__Restickify__input0__permutation__32-to-32.mlir), [if](if-store/C018__decode__Restickify__input0__permutation__32-to-32.mlir)) | decode | `permutation` | 32 -> 32 | 5 | bmm_2-wtAttnHeadBreak-VirtualReshape-Output-Restickify | bmm_2-wtAttnHeadBreak-VirtualReshape_out |
-| C019 ([dist](dist-store/C019__decode__Scatter__input0__all_gather__16-to-1.mlir), [if](if-store/C019__decode__Scatter__input0__all_gather__16-to-1.mlir)) | decode | `all_gather` | 16 -> 1 | 4 | cat_1-kvCacheScatter | view_5-VirtualReshape_out |
-| C020 ([dist](dist-store/C020__decode__Stcdp__input0__general_relayout__1-to-32.mlir), [if](if-store/C020__decode__Stcdp__input0__general_relayout__1-to-32.mlir)) | decode | `general_relayout` | 1 -> 32 | 3 | embedding-Output-Stcdp | embedding_out |
-| C021 ([dist](dist-store/C021__decode__Sub__input1__replicate_or_owner_remap__8-to-8.mlir), [if](if-store/C021__decode__Sub__input1__replicate_or_owner_remap__8-to-8.mlir)) | decode | `replicate_or_owner_remap` | 8 -> 8 | 4 | _safe_softmax-Sub | _safe_softmax-Max_out |
-| C022 ([dist](dist-store/C022__decode__Sum__input0__all_gather__32-to-8.mlir), [if](if-store/C022__decode__Sum__input0__all_gather__32-to-8.mlir)) | decode | `all_gather` | 32 -> 8 | 4 | _safe_softmax-Sum | _safe_softmax-Exp_out |
-| C023 ([dist](dist-store/C023__prefill__Add__input1__all_gather__16-to-32.mlir), [if](if-store/C023__prefill__Add__input1__all_gather__16-to-32.mlir)) | prefill | `all_gather` | 16 -> 32 | 3 | add_3 | mul_out |
-| C024 ([dist](dist-store/C024__prefill__BatchMatMulV2__input0__all_gather__32-to-32.mlir), [if](if-store/C024__prefill__BatchMatMulV2__input0__all_gather__32-to-32.mlir)) | prefill | `all_gather` | 32 -> 32 | 5 | bmm_2-BMM_1 | bmm_2-actAttnHeadBreak-VirtualReshape_out |
-| C025 ([dist](dist-store/C025__prefill__BatchMatMulV2__input0__grouped_all_gather_with_replication__16-to-8.mlir), [if](if-store/C025__prefill__BatchMatMulV2__input0__grouped_all_gather_with_replication__16-to-8.mlir)) | prefill | `grouped_all_gather_with_replication` | 16 -> 8 | 3 | mm-BMM_1 | mean-LayerNormNorm_out |
-| C026 ([dist](dist-store/C026__prefill__BatchMatMulV2__input0__grouped_all_gather_with_replication__32-to-1.mlir), [if](if-store/C026__prefill__BatchMatMulV2__input0__grouped_all_gather_with_replication__32-to-1.mlir)) | prefill | `grouped_all_gather_with_replication` | 32 -> 1 | 3 | mm_280-BMM_1 | slice_161-Stcdp_out |
-| C027 ([dist](dist-store/C027__prefill__BatchMatMulV2__input0__grouped_all_gather_with_replication__32-to-8.mlir), [if](if-store/C027__prefill__BatchMatMulV2__input0__grouped_all_gather_with_replication__32-to-8.mlir)) | prefill | `grouped_all_gather_with_replication` | 32 -> 8 | 3 | mm_10-BMM_1 | view_41-VirtualReshape_out |
-| C028 ([dist](dist-store/C028__prefill__BatchMatMulV2__input1__grouped_all_gather_with_replication__32-to-1.mlir), [if](if-store/C028__prefill__BatchMatMulV2__input1__grouped_all_gather_with_replication__32-to-1.mlir)) | prefill | `grouped_all_gather_with_replication` | 32 -> 1 | 5 | bmm_2-BMM_1 | mul_17_out |
-| C029 ([dist](dist-store/C029__prefill__BatchMatMulV2__input1__grouped_all_gather_with_replication__32-to-1.mlir), [if](if-store/C029__prefill__BatchMatMulV2__input1__grouped_all_gather_with_replication__32-to-1.mlir)) | prefill | `grouped_all_gather_with_replication` | 32 -> 1 | 5 | bmm_3-BMM_1 | bmm_3-wtAttnHeadBreak-VirtualReshape_out |
-| C030 ([dist](dist-store/C030__prefill__Exx2__input0__all_gather__32-to-8.mlir), [if](if-store/C030__prefill__Exx2__input0__all_gather__32-to-8.mlir)) | prefill | `all_gather` | 32 -> 8 | 3 | mean_1-Exx2 | add_3_out |
-| C031 ([dist](dist-store/C031__prefill__LayerNormNorm__input1__replicate_or_owner_remap__8-to-8.mlir), [if](if-store/C031__prefill__LayerNormNorm__input1__replicate_or_owner_remap__8-to-8.mlir)) | prefill | `replicate_or_owner_remap` | 8 -> 8 | 3 | mean_1-LayerNormNorm | mean_1-Exx2_out |
-| C032 ([dist](dist-store/C032__prefill__LayerNormNorm__input2__replicate_or_owner_remap__8-to-8.mlir), [if](if-store/C032__prefill__LayerNormNorm__input2__replicate_or_owner_remap__8-to-8.mlir)) | prefill | `replicate_or_owner_remap` | 8 -> 8 | 3 | mean_1-LayerNormNorm | mean_1-LayerNormScale_out |
-| C033 ([dist](dist-store/C033__prefill__Mul__input1__grouped_all_gather_with_replication__16-to-8.mlir), [if](if-store/C033__prefill__Mul__input1__grouped_all_gather_with_replication__16-to-8.mlir)) | prefill | `grouped_all_gather_with_replication` | 16 -> 8 | 6 | mul_14-mul_1 | mul_14-split_2-Ds0_out |
-| C034 ([dist](dist-store/C034__prefill__Restickify__input0__permutation__32-to-32.mlir), [if](if-store/C034__prefill__Restickify__input0__permutation__32-to-32.mlir)) | prefill | `permutation` | 32 -> 32 | 5 | bmm-wtAttnHeadBreak-VirtualReshape-Output-Restickify | bmm-wtAttnHeadBreak-VirtualReshape_out |
-| C035 ([dist](dist-store/C035__prefill__Stcdp__input0__permutation__32-to-32.mlir), [if](if-store/C035__prefill__Stcdp__input0__permutation__32-to-32.mlir)) | prefill | `permutation` | 32 -> 32 | 3 | slice_161-Stcdp | mean_80-LayerNormNorm_out |
+| C001 ([dist](dist-store/C001__decode__BatchMatMulV2__input0__grouped_all_gather_with_replication__25-to-1.mlir), [if](if-store/C001__decode__BatchMatMulV2__input0__grouped_all_gather_with_replication__25-to-1.mlir)) | decode | `grouped_all_gather_with_replication` | 25 -> 1 | 4 | mm_13-BMM_1 | mul_263_out |
+| C002 ([dist](dist-store/C002__decode__BatchMatMulV2__input0__grouped_all_gather_with_replication__32-to-1.mlir), [if](if-store/C002__decode__BatchMatMulV2__input0__grouped_all_gather_with_replication__32-to-1.mlir)) | decode | `grouped_all_gather_with_replication` | 32 -> 1 | 4 | mm_1-BMM_1 | mean-LayerNormNorm_out |
+| C003 ([dist](dist-store/C003__decode__BatchMatMulV2__input0__grouped_all_gather_with_replication__32-to-1.mlir), [if](if-store/C003__decode__BatchMatMulV2__input0__grouped_all_gather_with_replication__32-to-1.mlir)) | decode | `grouped_all_gather_with_replication` | 32 -> 1 | 4 | mm_11-BMM_1 | mean_3-LayerNormNorm_out |
+| C004 ([dist](dist-store/C004__decode__BatchMatMulV2__input0__grouped_all_gather_with_replication__32-to-1.mlir), [if](if-store/C004__decode__BatchMatMulV2__input0__grouped_all_gather_with_replication__32-to-1.mlir)) | decode | `grouped_all_gather_with_replication` | 32 -> 1 | 4 | mm_280-BMM_1 | mean_80-LayerNormNorm_out |
+| C005 ([dist](dist-store/C005__decode__BatchMatMulV2__input0__grouped_all_gather_with_replication__32-to-1.mlir), [if](if-store/C005__decode__BatchMatMulV2__input0__grouped_all_gather_with_replication__32-to-1.mlir)) | decode | `grouped_all_gather_with_replication` | 32 -> 1 | 4 | mm-BMM_1 | mean-LayerNormNorm_out |
+| C006 ([dist](dist-store/C006__decode__BatchMatMulV2__input0__grouped_all_gather_with_replication__32-to-8.mlir), [if](if-store/C006__decode__BatchMatMulV2__input0__grouped_all_gather_with_replication__32-to-8.mlir)) | decode | `grouped_all_gather_with_replication` | 32 -> 8 | 6 | bmm_2-BMM_1 | bmm_2-actAttnHeadBreak-VirtualReshape_out |
+| C007 ([dist](dist-store/C007__decode__BatchMatMulV2__input0__grouped_all_gather_with_replication__32-to-16.mlir), [if](if-store/C007__decode__BatchMatMulV2__input0__grouped_all_gather_with_replication__32-to-16.mlir)) | decode | `grouped_all_gather_with_replication` | 32 -> 16 | 6 | bmm_3-BMM_1 | bmm_3-actAttnHeadBreak-VirtualReshape_out |
+| C008 ([dist](dist-store/C008__decode__BatchMatMulV2__input1__all_gather__32-to-32.mlir), [if](if-store/C008__decode__BatchMatMulV2__input1__all_gather__32-to-32.mlir)) | decode | `all_gather` | 32 -> 32 | 6 | bmm-BMM_1 | mul_114_out |
+| C009 ([dist](dist-store/C009__decode__BatchMatMulV2__input1__grouped_all_gather_with_replication__32-to-16.mlir), [if](if-store/C009__decode__BatchMatMulV2__input1__grouped_all_gather_with_replication__32-to-16.mlir)) | decode | `grouped_all_gather_with_replication` | 32 -> 16 | 6 | bmm_3-BMM_1 | bmm_3-wtAttnHeadBreak-VirtualReshape_out |
+| C010 ([dist](dist-store/C010__decode__Exx2__input0__all_gather__32-to-1.mlir), [if](if-store/C010__decode__Exx2__input0__all_gather__32-to-1.mlir)) | decode | `all_gather` | 32 -> 1 | 4 | mean-Exx2 | mul_out |
+| C011 ([dist](dist-store/C011__decode__LayerNormNorm__input1__replicate_or_owner_remap__1-to-1.mlir), [if](if-store/C011__decode__LayerNormNorm__input1__replicate_or_owner_remap__1-to-1.mlir)) | decode | `replicate_or_owner_remap` | 1 -> 1 | 4 | mean-LayerNormNorm | mean-Exx2_out |
+| C012 ([dist](dist-store/C012__decode__LayerNormNorm__input2__replicate_or_owner_remap__1-to-1.mlir), [if](if-store/C012__decode__LayerNormNorm__input2__replicate_or_owner_remap__1-to-1.mlir)) | decode | `replicate_or_owner_remap` | 1 -> 1 | 4 | mean-LayerNormNorm | mean-LayerNormScale_out |
+| C013 ([dist](dist-store/C013__decode__Max__input0__all_gather__32-to-8.mlir), [if](if-store/C013__decode__Max__input0__all_gather__32-to-8.mlir)) | decode | `all_gather` | 32 -> 8 | 5 | _safe_softmax-Max | _safe_softmax-Where3-inp0Masking_out |
+| C014 ([dist](dist-store/C014__decode__Mul__input1__grouped_all_gather_with_replication__2-to-1.mlir), [if](if-store/C014__decode__Mul__input1__grouped_all_gather_with_replication__2-to-1.mlir)) | decode | `grouped_all_gather_with_replication` | 2 -> 1 | 7 | mul_138-mul_1 | mul_138-split_2-Ds0_out |
+| C015 ([dist](dist-store/C015__decode__Mul__input1__grouped_all_gather_with_replication__2-to-1.mlir), [if](if-store/C015__decode__Mul__input1__grouped_all_gather_with_replication__2-to-1.mlir)) | decode | `grouped_all_gather_with_replication` | 2 -> 1 | 7 | mul_137-mul_1 | mul_137-split_2-Ds0_out |
+| C016 ([dist](dist-store/C016__decode__Mul__input1__replicate_or_owner_remap__8-to-8.mlir), [if](if-store/C016__decode__Mul__input1__replicate_or_owner_remap__8-to-8.mlir)) | decode | `replicate_or_owner_remap` | 8 -> 8 | 5 | _safe_softmax_1-Mul | _safe_softmax_1-Reciprocal_out |
+| C017 ([dist](dist-store/C017__decode__Restickify__input0__all_gather__32-to-32.mlir), [if](if-store/C017__decode__Restickify__input0__all_gather__32-to-32.mlir)) | decode | `all_gather` | 32 -> 32 | 6 | bmm-wtAttnHeadBreak-VirtualReshape-Output-Restickify | bmm-wtAttnHeadBreak-VirtualReshape_out |
+| C018 ([dist](dist-store/C018__decode__Restickify__input0__permutation__32-to-32.mlir), [if](if-store/C018__decode__Restickify__input0__permutation__32-to-32.mlir)) | decode | `permutation` | 32 -> 32 | 6 | bmm_2-wtAttnHeadBreak-VirtualReshape-Output-Restickify | bmm_2-wtAttnHeadBreak-VirtualReshape_out |
+| C019 ([dist](dist-store/C019__decode__Scatter__input0__all_gather__16-to-1.mlir), [if](if-store/C019__decode__Scatter__input0__all_gather__16-to-1.mlir)) | decode | `all_gather` | 16 -> 1 | 5 | cat_1-kvCacheScatter | view_5-VirtualReshape_out |
+| C020 ([dist](dist-store/C020__decode__Stcdp__input0__general_relayout__1-to-32.mlir), [if](if-store/C020__decode__Stcdp__input0__general_relayout__1-to-32.mlir)) | decode | `general_relayout` | 1 -> 32 | 4 | embedding-Output-Stcdp | embedding_out |
+| C021 ([dist](dist-store/C021__decode__Sub__input1__replicate_or_owner_remap__8-to-8.mlir), [if](if-store/C021__decode__Sub__input1__replicate_or_owner_remap__8-to-8.mlir)) | decode | `replicate_or_owner_remap` | 8 -> 8 | 5 | _safe_softmax-Sub | _safe_softmax-Max_out |
+| C022 ([dist](dist-store/C022__decode__Sum__input0__all_gather__32-to-8.mlir), [if](if-store/C022__decode__Sum__input0__all_gather__32-to-8.mlir)) | decode | `all_gather` | 32 -> 8 | 5 | _safe_softmax-Sum | _safe_softmax-Exp_out |
+| C023 ([dist](dist-store/C023__prefill__Add__input1__all_gather__16-to-32.mlir), [if](if-store/C023__prefill__Add__input1__all_gather__16-to-32.mlir)) | prefill | `all_gather` | 16 -> 32 | 4 | add_3 | mul_out |
+| C024 ([dist](dist-store/C024__prefill__BatchMatMulV2__input0__all_gather__32-to-32.mlir), [if](if-store/C024__prefill__BatchMatMulV2__input0__all_gather__32-to-32.mlir)) | prefill | `all_gather` | 32 -> 32 | 6 | bmm_2-BMM_1 | bmm_2-actAttnHeadBreak-VirtualReshape_out |
+| C025 ([dist](dist-store/C025__prefill__BatchMatMulV2__input0__grouped_all_gather_with_replication__16-to-8.mlir), [if](if-store/C025__prefill__BatchMatMulV2__input0__grouped_all_gather_with_replication__16-to-8.mlir)) | prefill | `grouped_all_gather_with_replication` | 16 -> 8 | 4 | mm-BMM_1 | mean-LayerNormNorm_out |
+| C026 ([dist](dist-store/C026__prefill__BatchMatMulV2__input0__grouped_all_gather_with_replication__32-to-1.mlir), [if](if-store/C026__prefill__BatchMatMulV2__input0__grouped_all_gather_with_replication__32-to-1.mlir)) | prefill | `grouped_all_gather_with_replication` | 32 -> 1 | 4 | mm_280-BMM_1 | slice_161-Stcdp_out |
+| C027 ([dist](dist-store/C027__prefill__BatchMatMulV2__input0__grouped_all_gather_with_replication__32-to-8.mlir), [if](if-store/C027__prefill__BatchMatMulV2__input0__grouped_all_gather_with_replication__32-to-8.mlir)) | prefill | `grouped_all_gather_with_replication` | 32 -> 8 | 4 | mm_10-BMM_1 | view_41-VirtualReshape_out |
+| C028 ([dist](dist-store/C028__prefill__BatchMatMulV2__input1__grouped_all_gather_with_replication__32-to-1.mlir), [if](if-store/C028__prefill__BatchMatMulV2__input1__grouped_all_gather_with_replication__32-to-1.mlir)) | prefill | `grouped_all_gather_with_replication` | 32 -> 1 | 6 | bmm_2-BMM_1 | mul_17_out |
+| C029 ([dist](dist-store/C029__prefill__BatchMatMulV2__input1__grouped_all_gather_with_replication__32-to-1.mlir), [if](if-store/C029__prefill__BatchMatMulV2__input1__grouped_all_gather_with_replication__32-to-1.mlir)) | prefill | `grouped_all_gather_with_replication` | 32 -> 1 | 6 | bmm_3-BMM_1 | bmm_3-wtAttnHeadBreak-VirtualReshape_out |
+| C030 ([dist](dist-store/C030__prefill__Exx2__input0__all_gather__32-to-8.mlir), [if](if-store/C030__prefill__Exx2__input0__all_gather__32-to-8.mlir)) | prefill | `all_gather` | 32 -> 8 | 4 | mean_1-Exx2 | add_3_out |
+| C031 ([dist](dist-store/C031__prefill__LayerNormNorm__input1__replicate_or_owner_remap__8-to-8.mlir), [if](if-store/C031__prefill__LayerNormNorm__input1__replicate_or_owner_remap__8-to-8.mlir)) | prefill | `replicate_or_owner_remap` | 8 -> 8 | 4 | mean_1-LayerNormNorm | mean_1-Exx2_out |
+| C032 ([dist](dist-store/C032__prefill__LayerNormNorm__input2__replicate_or_owner_remap__8-to-8.mlir), [if](if-store/C032__prefill__LayerNormNorm__input2__replicate_or_owner_remap__8-to-8.mlir)) | prefill | `replicate_or_owner_remap` | 8 -> 8 | 4 | mean_1-LayerNormNorm | mean_1-LayerNormScale_out |
+| C033 ([dist](dist-store/C033__prefill__Mul__input1__grouped_all_gather_with_replication__16-to-8.mlir), [if](if-store/C033__prefill__Mul__input1__grouped_all_gather_with_replication__16-to-8.mlir)) | prefill | `grouped_all_gather_with_replication` | 16 -> 8 | 7 | mul_14-mul_1 | mul_14-split_2-Ds0_out |
+| C034 ([dist](dist-store/C034__prefill__Restickify__input0__permutation__32-to-32.mlir), [if](if-store/C034__prefill__Restickify__input0__permutation__32-to-32.mlir)) | prefill | `permutation` | 32 -> 32 | 6 | bmm-wtAttnHeadBreak-VirtualReshape-Output-Restickify | bmm-wtAttnHeadBreak-VirtualReshape_out |
+| C035 ([dist](dist-store/C035__prefill__Stcdp__input0__permutation__32-to-32.mlir), [if](if-store/C035__prefill__Stcdp__input0__permutation__32-to-32.mlir)) | prefill | `permutation` | 32 -> 32 | 4 | slice_161-Stcdp | mean_80-LayerNormNorm_out |
 
 ## Provenance, and regenerating
 

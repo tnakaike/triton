@@ -22,8 +22,9 @@ are exactly the slot owners, and each stores into its own slot only.
 
 **The composed destination is a global view of disjoint slots.** Every
 *(piece, owner)* pair is a slot of the result and the slots of one piece stack on
-dimension 0, so C002 -- the whole 4096-element tensor on 16 cores -- composes to
-`memref<65536x1x1xf16>`, its 16 views covering `[0, 4096)`, `[4096, 8192)`, ...
+physical dimension 0, so C002 -- the whole tensor, physically `[1, 64, 1, 64]`,
+on 16 cores -- composes to `memref<16x64x1x64xf16>`, its 16 views covering
+`y = 0`, `y = 1`, ...
 [The parent README](../README.md) states the rule and the other case it decides,
 C035, whose destination covers one row of 512.
 
