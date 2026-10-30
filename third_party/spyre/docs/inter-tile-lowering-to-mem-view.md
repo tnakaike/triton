@@ -156,7 +156,8 @@ has pinned into its own scratchpad; reading it at the coordinates of the region 
 ends up holding is the transfer, and pinning the result is the landing:
 
 ```python
-share = x_desc.load([pid * 16, 0])                      # my share, a tensor
+x     = x_desc.load([pid * 16, 0])
+share = tl.exp(x)                                       # my share, computed on-chip
 tl.spyre_pin(share, "ct_local", offset=SRC_OFF)         # where my share lives
 whole = tl.make_distributed_descriptor(
     share, work_slices=SRC, axes=["mb", None], block_shape=[...],
@@ -218,6 +219,16 @@ cores": the pin is what gives each partition its scratchpad offset, and nothing 
 supplies one. A landing is pinned for the same reason and one more: a tile received over
 the interconnect has to be resident in the scratchpad before a compute unit can read it,
 so a copy's landing cannot stay in registers. The pin is therefore required on both.
+
+**What a pin does, whatever produced the value.** A pin names a value, and its annotation
+is attached to the op that has that value as its result — a compute such as `tl.exp`, or
+the load of an HBM descriptor, alike; the kind of op makes no difference. The value is
+stored into the scratchpad at the pin's offset directly after that op, the earliest point
+it exists, and every use of it then reads it back from there. That store is not an extra
+copy: a relayout moves data over the scratchpad interconnect, so a share has to be
+resident in the scratchpad before it can be sent, and the store is how it gets there.
+Where the pinned value was loaded from global memory, what is placed is the loaded copy;
+the tensor in global memory is unaffected.
 
 ## 3. Phases
 
