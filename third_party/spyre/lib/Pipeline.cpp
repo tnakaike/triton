@@ -31,6 +31,21 @@ void mlir::triton::spyre::buildTTIRToKTIRPipeline(
   // tt.reduce/broadcast/expand_dims/dot -> linalg + tensor, and a dead-op sweep.
   pm.addPass(createLowerComputeOpsPass());
 
+  // tts.make_distributed_descriptor -> one memory view per partition plus the
+  // compose, with the reads through it. After LowerComputeOps, because the share
+  // has to be a linalg/tensor value by then.
+  //
+  // BEFORE LowerTTSMarkers, which is this stage's last pass now, so the compose
+  // reads a share's placement off the `tts.pin` MARKER OP -- the marker is still
+  // standing here, and the attribute does not exist yet.
+  //
+  // That ordering is also what keeps the share alive rather than merely readable.
+  // Erasing the compose removes the share's only other use, so from here until
+  // MaterializePinnedBuffers honours it in `spyrecode` the marker is the only thing
+  // holding the value against this stage's closing DCE. See LowerTTSMarkers'
+  // contract for why that pass runs after the canonicalize.
+  pm.addPass(createLowerDistributedDescPass(options.grid));
+
   // tt.func/tt.return -> func.func/func.return, !tt.ptr -> index. Last of the
   // conversions, because every memory pass above consumes !tt.ptr arguments
   // through getBasePtrAsIndex. metadata["name"] and the base-address inference

@@ -169,6 +169,41 @@ def ConvertFunctions : Pass<"convert-ttir-functions", "mlir::ModuleOp"> {
     ];
 }
 
+def LowerDistributedDesc : Pass<"lower-distributed-desc", "mlir::ModuleOp"> {
+    let summary = "Lower tts.make_distributed_descriptor, and the reads through "
+                  "it, to a composed ktdp memory view.";
+    let description = [{
+        Input: TTIR after LowerComputeOps, with tts.make_distributed_descriptor
+        ops whose share operand is by now a ktdp.load from the buffer
+        tl.spyre_pin asked for, together with the tt.descriptor_load ops reading
+        their results.
+
+        Output: no tts.make_distributed_descriptor remains. A compose leaves one
+        ktdp.construct_memory_view per partition, a
+        ktdp.construct_distributed_memory_view over them, and an access tile plus
+        ktdp.load for each read that went through it.
+
+        The landing store a received tile needs before a compute unit can read it
+        is NOT emitted here. It is a tl.spyre_pin on the loaded value, and it is
+        honoured LATER than this pass rather than earlier: LowerTTSMarkers turns the
+        marker into an attribute at the end of this stage, and
+        MaterializePinnedBuffers builds the buffer at the head of `spyrecode`.
+    }];
+
+    let dependentDialects = [
+        "mlir::ktdp::KtdpDialect",
+        "mlir::arith::ArithDialect"
+    ];
+
+    // A compose has to decide whether its partition table has one entry per
+    // TILE -- a claim about the launch grid, unanswerable from the table alone.
+    let options = [
+        ListOption<"grid", "grid", "int64_t",
+                   "Per-axis partition of the Spyre hardware grid, as "
+                   "DistributeWork takes it. Default [32].">
+    ];
+}
+
 def DistributeWork : Pass<"distribute-work-to-spyre-cores", "mlir::ModuleOp"> {
     let summary = "Replace tt.get_program_id with ktdp.get_compute_tile_id "
                   "and fold tt.get_num_programs against the grid.";
