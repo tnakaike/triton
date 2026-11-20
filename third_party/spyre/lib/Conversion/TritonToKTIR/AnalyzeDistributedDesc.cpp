@@ -421,29 +421,34 @@ static LogicalResult analyzeRead(triton::DescriptorLoadOp load,
            << "no tile performs this read: on every tile an if around it "
               "skips it, so the value it pins never lands";
 
-  // TODO: several receivers of one box, which the design admits (§3 phase 3:
-  // the copies are laid apart along a further dimension, in ascending tile id)
-  // and this pass does not yet place in the destination.
-  std::map<SmallVector<int64_t>, int64_t> firstReader;
-  for (int64_t t : readers) {
-    auto [it, inserted] = firstReader.insert({*src[t], t});
-    if (!inserted)
+  // The tiles reading each block, in ascending tile id. Where several read one
+  // block they receive copies of it (a broadcast, or a gather onto several
+  // tiles), and every block must have the same number of copies: the copies of
+  // one block are laid apart along dimension 0, so a block with fewer would
+  // leave a hole in the destination (§3 phase 3, §10).
+  std::map<SmallVector<int64_t>, SmallVector<int64_t>> readersOf;
+  for (int64_t t : readers)
+    readersOf[*src[t]].push_back(t);
+  int64_t copies = readersOf.begin()->second.size();
+  for (auto &[box, tilesOfBox] : readersOf)
+    if ((int64_t)tilesOfBox.size() != copies)
       return load.emitError()
-             << "tiles " << it->second << " and " << t
-             << " both read the block at " << formatCoords(*src[t])
-             << ": several tiles receiving one block is not supported yet";
-  }
+             << "the block at " << formatCoords(readersOf.begin()->first)
+             << " is read by " << copies << " tiles and the block at "
+             << formatCoords(box) << " by " << tilesOfBox.size()
+             << ": every block needs the same number of copies for the "
+                "copies to tile the destination";
 
-  // The destination is the union of the blocks, so they must tile a box: on
-  // each dimension the distinct starts sit one block apart, and every
-  // combination of them is read. Distinct blocks and a count equal to the
-  // product of the per-dimension counts make that a one-to-one cover.
+  // The distinct blocks must tile a box: on each dimension their starts sit
+  // one block apart, and every combination of them is read. Distinct blocks and
+  // a count equal to the product of the per-dimension counts make that a
+  // one-to-one cover.
   SmallVector<int64_t> lo(rank), dstShape(rank);
   int64_t cells = 1;
   for (unsigned d = 0; d < rank; ++d) {
     std::set<int64_t> starts;
-    for (int64_t t : readers)
-      starts.insert((*src[t])[d]);
+    for (auto &[box, _] : readersOf)
+      starts.insert(box[d]);
     lo[d] = *starts.begin();
     int64_t k = 0;
     for (int64_t s : starts) {
@@ -459,11 +464,24 @@ static LogicalResult analyzeRead(triton::DescriptorLoadOp load,
     dstShape[d] = k * block[d];
     cells *= k;
   }
-  if (cells != (int64_t)readers.size())
+  if (cells != (int64_t)readersOf.size())
     return load.emitError()
-           << readers.size() << " tiles read, and their blocks span " << cells
+           << readersOf.size() << " distinct blocks are read, and they span "
+           << cells
            << " places: every place in the box they span must be read for the "
               "destination to be whole";
+
+  // The copies, as slabs along dimension 0 in ascending tile id: the c-th
+  // reader of a block lands c slabs down, a slab being the distinct blocks'
+  // union. Dimension 0 by rule rather than by choice per kernel, so the same
+  // kernel always lowers the same way; nothing reads the destination as a
+  // global view, so any one rule is correct (§3 phase 3).
+  int64_t slab = dstShape[0];
+  dstShape[0] *= copies;
+  SmallVector<int64_t> copyIndex(tiles, 0);
+  for (auto &[box, tilesOfBox] : readersOf)
+    for (auto [c, t] : llvm::enumerate(tilesOfBox))
+      copyIndex[t] = c;
 
   // --- the attribute ---------------------------------------------------------
   Builder b(load.getContext());
@@ -477,6 +495,7 @@ static LogicalResult analyzeRead(triton::DescriptorLoadOp load,
     SmallVector<int64_t> dst(rank);
     for (unsigned d = 0; d < rank; ++d)
       dst[d] = (*src[t])[d] - lo[d];
+    dst[0] += copyIndex[t] * slab;
     srcList.push_back(b.getDenseI64ArrayAttr(*src[t]));
     dstList.push_back(b.getDenseI64ArrayAttr(dst));
   }

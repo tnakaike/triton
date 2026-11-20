@@ -187,6 +187,62 @@ static Value cloneAhead(OpBuilder &b, Value v, Operation *hoist,
   return b.clone(*def, mapping)->getResult(0);
 }
 
+/// The part of a dst coordinate that copies add: `slab * ((t / q) % copies)`
+/// on tile t.
+struct CopyTerm {
+  int64_t slab, q, copies;
+};
+
+/// What the copies add to dimension `d`'s dst coordinate beyond the src
+/// coordinate minus the dst view's origin. nullopt where nothing is added --
+/// every dimension of a read without copies, and every dimension but the one
+/// they are laid along. Otherwise the term `slab * ((t / q) % copies)`, with
+/// the smallest q that gives every dst tile its copy index; failure where no q
+/// does, and the coordinate then comes from the table. A tile that does not
+/// receive may get any value: its transfer does nothing.
+static FailureOr<std::optional<CopyTerm>>
+copyTermOf(const triton::tts::DistLanding &landing, unsigned d, int64_t origin,
+           int64_t tiles) {
+  SmallVector<std::pair<int64_t, int64_t>> extra; // (tile, added)
+  for (auto [t, src, dst] :
+       llvm::enumerate(landing.srcCoordinates, landing.dstCoordinates))
+    if (src)
+      extra.push_back({(int64_t)t, (*dst)[d] - ((*src)[d] - origin)});
+  int64_t slab = 0;
+  for (auto [t, e] : extra)
+    if (e > 0 && (slab == 0 || e < slab))
+      slab = e;
+  if (slab == 0)
+    return std::optional<CopyTerm>();
+  int64_t copies = 1;
+  for (auto [t, e] : extra) {
+    if (e % slab != 0)
+      return failure();
+    copies = std::max(copies, e / slab + 1);
+  }
+  for (int64_t q = 1; q <= tiles; ++q)
+    if (llvm::all_of(extra, [&](auto te) {
+          return (te.first / q) % copies == te.second / slab;
+        }))
+      return std::optional<CopyTerm>(CopyTerm{slab, q, copies});
+  return failure();
+}
+
+/// `term` on the tile `tileId`, as index arithmetic. The `% copies` is left out
+/// where `t / q` stays below `copies` on every tile of the grid.
+static Value buildCopyTerm(OpBuilder &b, Location loc, Value tileId,
+                           const CopyTerm &term, int64_t tiles) {
+  auto cst = [&](int64_t v) {
+    return arith::ConstantIndexOp::create(b, loc, v).getResult();
+  };
+  Value c = tileId;
+  if (term.q != 1)
+    c = arith::DivSIOp::create(b, loc, c, cst(term.q));
+  if ((tiles - 1) / term.q >= term.copies)
+    c = arith::RemSIOp::create(b, loc, c, cst(term.copies));
+  return arith::MulIOp::create(b, loc, c, cst(term.slab));
+}
+
 /// Lower a read whose value lands in a pin, from what AnalyzeDistributedDesc
 /// stated on the landing marker (design §3 phases 3-4).
 ///
@@ -332,6 +388,19 @@ static LogicalResult lowerLandedRead(triton::DescriptorLoadOp load,
       Value o = arith::ConstantIndexOp::create(rewriter, loc, origin[d]);
       dst = arith::SubIOp::create(rewriter, loc, src, o);
     }
+    // Where several dst tiles read one block, the dst coordinate on the
+    // dimension the copies are laid along is further down by the copy's slab,
+    // which the read's expression does not give.
+    FailureOr<std::optional<CopyTerm>> copy =
+        copyTermOf(landing, d, origin[d], cores);
+    if (failed(copy)) {
+      dstIdx.push_back(chainFor(landing.dstCoordinates, d));
+      continue;
+    }
+    if (*copy)
+      dst = arith::AddIOp::create(
+          rewriter, loc, dst,
+          buildCopyTerm(rewriter, loc, getTileId(), **copy, cores));
     dstIdx.push_back(dst);
   }
   Value srcTile = mlir::triton::ktdp::buildAccessTile(rewriter, loc, whole,

@@ -130,7 +130,10 @@ def TTS_Dialect : Dialect {
     ///                     dst view is the composed destination, the union of
     ///                     the blocks the dst tiles land, so on a dimension
     ///                     they differ in it is their count times the block
-    ///                     extent, and elsewhere it is the block extent.
+    ///                     extent, and elsewhere it is the block extent. Where
+    ///                     several dst tiles read one block, dimension 0 is
+    ///                     also multiplied by that number of copies: the
+    ///                     copies are laid along it in ascending tile id.
     ///   dst_coordinates : one entry per dst tile, `unit` exactly where
     ///                     src_coordinates is: where that dst tile's block
     ///                     sits, in the DST VIEW's coordinates.

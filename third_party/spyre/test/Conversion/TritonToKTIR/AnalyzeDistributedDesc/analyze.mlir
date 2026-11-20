@@ -189,3 +189,71 @@ tt.func @unpinned_read(%x: tensor<1x64xf16>, %row: i32) -> tensor<1x64xf16> {
   %v = tt.descriptor_load %w[%row, %c0] : !tt.tensordesc<1x64xf16> -> tensor<1x64xf16>
   tt.return %v : tensor<1x64xf16>
 }
+
+// -----
+// Copies: the design doc's worked example. The even tiles both read the whole
+// [4, 64], so each receives a copy, and the copies are laid along dimension 0 in
+// ascending tile id: tile 0's at rows 0-3 and tile 2's at rows 4-7 of an [8, 64]
+// destination.
+// CHECK-LABEL: tt.func @gather_onto_the_even_tiles
+// CHECK: tts.dist_landing = {dst_coordinates = [array<i64: 0, 0>, unit, array<i64: 4, 0>, unit], dst_shape = array<i64: 8, 64>, src_coordinates = [array<i64: 0, 0>, unit, array<i64: 0, 0>, unit]}
+tt.func @gather_onto_the_even_tiles(%x: tensor<1x64xf16>) {
+  %share = math.exp %x : tensor<1x64xf16>
+  tts.pin %share {memory_space = "ct_local", offset = 0 : i32} : tensor<1x64xf16>
+  %w = tts.make_distributed_descriptor %share
+      {work_slices = [{mb = 0 : i64}, {mb = 1 : i64}, {mb = 2 : i64}, {mb = 3 : i64}],
+       axes = ["mb", ""], block_shape = array<i64: 4, 64>}
+      : tensor<1x64xf16> -> !tt.tensordesc<4x64xf16>
+  %pid = tt.get_program_id x : i32
+  %c0 = arith.constant 0 : i32
+  %c2 = arith.constant 2 : i32
+  %m = arith.remsi %pid, %c2 : i32
+  %even = arith.cmpi eq, %m, %c0 : i32
+  scf.if %even {
+    %v = tt.descriptor_load %w[%c0, %c0] : !tt.tensordesc<4x64xf16> -> tensor<4x64xf16>
+    tts.pin %v {memory_space = "ct_local", offset = 4096 : i32} : tensor<4x64xf16>
+  }
+  tt.return
+}
+
+// -----
+// A broadcast: every tile reads the whole source, so there are four copies and a
+// [16, 64] destination.
+// CHECK-LABEL: tt.func @broadcast
+// CHECK: tts.dist_landing = {dst_coordinates = [array<i64: 0, 0>, array<i64: 4, 0>, array<i64: 8, 0>, array<i64: 12, 0>], dst_shape = array<i64: 16, 64>, src_coordinates = [array<i64: 0, 0>, array<i64: 0, 0>, array<i64: 0, 0>, array<i64: 0, 0>]}
+tt.func @broadcast(%x: tensor<1x64xf16>) {
+  %share = math.exp %x : tensor<1x64xf16>
+  tts.pin %share {memory_space = "ct_local", offset = 0 : i32} : tensor<1x64xf16>
+  %w = tts.make_distributed_descriptor %share
+      {work_slices = [{mb = 0 : i64}, {mb = 1 : i64}, {mb = 2 : i64}, {mb = 3 : i64}],
+       axes = ["mb", ""], block_shape = array<i64: 4, 64>}
+      : tensor<1x64xf16> -> !tt.tensordesc<4x64xf16>
+  %c0 = arith.constant 0 : i32
+  %v = tt.descriptor_load %w[%c0, %c0] : !tt.tensordesc<4x64xf16> -> tensor<4x64xf16>
+  tts.pin %v {memory_space = "ct_local", offset = 4096 : i32} : tensor<4x64xf16>
+  tt.return
+}
+
+// -----
+// Distinct blocks and copies together: tile t reads rows 2 * (t % 2) .. + 1, so
+// two blocks with two copies each. The distinct blocks make a [4, 64] slab, and
+// the second copy of each lands one slab down: tiles 0 and 1 in the first slab,
+// tiles 2 and 3 in the second.
+// CHECK-LABEL: tt.func @blocks_and_copies
+// CHECK: tts.dist_landing = {dst_coordinates = [array<i64: 0, 0>, array<i64: 2, 0>, array<i64: 4, 0>, array<i64: 6, 0>], dst_shape = array<i64: 8, 64>, src_coordinates = [array<i64: 0, 0>, array<i64: 2, 0>, array<i64: 0, 0>, array<i64: 2, 0>]}
+tt.func @blocks_and_copies(%x: tensor<1x64xf16>) {
+  %share = math.exp %x : tensor<1x64xf16>
+  tts.pin %share {memory_space = "ct_local", offset = 0 : i32} : tensor<1x64xf16>
+  %w = tts.make_distributed_descriptor %share
+      {work_slices = [{mb = 0 : i64}, {mb = 1 : i64}, {mb = 2 : i64}, {mb = 3 : i64}],
+       axes = ["mb", ""], block_shape = array<i64: 2, 64>}
+      : tensor<1x64xf16> -> !tt.tensordesc<2x64xf16>
+  %pid = tt.get_program_id x : i32
+  %c0 = arith.constant 0 : i32
+  %c2 = arith.constant 2 : i32
+  %m = arith.remsi %pid, %c2 : i32
+  %row = arith.muli %m, %c2 : i32
+  %v = tt.descriptor_load %w[%row, %c0] : !tt.tensordesc<2x64xf16> -> tensor<2x64xf16>
+  tts.pin %v {memory_space = "ct_local", offset = 4096 : i32} : tensor<2x64xf16>
+  tt.return
+}

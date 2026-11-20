@@ -182,14 +182,17 @@ def AnalyzeDistributedDesc : Pass<"analyze-distributed-desc", "mlir::ModuleOp"> 
         with tt.get_program_id x replaced by the tile id, the scf.if conditions
         enclosing the read and the coordinates it passes. The tiles whose
         conditions hold are the ones that read; the blocks they read, laid side
-        by side, are the destination. The result is written as the
-        tts.dist_landing dictionary on the landing marker (see TTSDialect.td).
+        by side, are the destination. Where several tiles read one block, each
+        receives a copy, and the copies are laid along dimension 0 in ascending
+        tile id. The result is written as the tts.dist_landing dictionary on
+        the landing marker (see TTSDialect.td).
 
         What it refuses, each at the read's Triton line: a condition or a
         coordinate that is not a constant on some tile (with a note at the value
-        that is not), a read inside anything but scf.if, a block outside the
-        composed source, two tiles reading the same block, and blocks that do
-        not tile a box.
+        that is not), a read inside anything but scf.if, a descriptor made
+        inside an if that guards the read, a block outside the composed source,
+        blocks that do not tile a box, and blocks read by differing numbers of
+        tiles.
 
         The IR is otherwise unchanged. A read whose value is not pinned is
         skipped: a reduction's read (design §7) is exempt from the landing, but

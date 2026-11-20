@@ -3,8 +3,8 @@
 // What AnalyzeDistributedDesc refuses, each at the read: the line a Triton kernel
 // points at. These are the design's "checks before the analysis" (every condition
 // and coordinate a constant on every tile, every block inside its composed view)
-// and the rule of its phase 3 that the blocks tile a box, plus what this pass does
-// not do yet (several receivers of one block).
+// and the rules of its phase 3: the blocks tile a box, and every block has the
+// same number of copies.
 //
 // Every case uses the same four-tile source, one [1, 64] share per tile composed
 // over `mb` into [4, 64], unless it says otherwise.
@@ -136,9 +136,10 @@ tt.func @no_tile_reads(%x: tensor<1x64xf16>) {
 }
 
 // -----
-// Two tiles reading the same block: the design lays such copies apart along a
-// further dimension, which this pass does not do yet.
-tt.func @two_tiles_one_block(%x: tensor<1x64xf16>) {
+// Blocks read by differing numbers of tiles: tiles 0, 1 and 2 read row 0 and
+// tile 3 reads row 1, so row 0 has three copies and row 1 one. Laid along
+// dimension 0, the copies could not tile the destination.
+tt.func @differing_copies(%x: tensor<1x64xf16>) {
   %share = math.exp %x : tensor<1x64xf16>
   tts.pin %share {memory_space = "ct_local", offset = 0 : i32} : tensor<1x64xf16>
   %w = tts.make_distributed_descriptor %share
@@ -147,9 +148,9 @@ tt.func @two_tiles_one_block(%x: tensor<1x64xf16>) {
       : tensor<1x64xf16> -> !tt.tensordesc<1x64xf16>
   %pid = tt.get_program_id x : i32
   %c0 = arith.constant 0 : i32
-  %c2 = arith.constant 2 : i32
-  %r = arith.divsi %pid, %c2 : i32
-  // expected-error @+1 {{tiles 0 and 1 both read the block at [0, 0]: several tiles receiving one block is not supported yet}}
+  %c3 = arith.constant 3 : i32
+  %r = arith.divsi %pid, %c3 : i32
+  // expected-error @+1 {{the block at [0, 0] is read by 3 tiles and the block at [1, 0] by 1: every block needs the same number of copies for the copies to tile the destination}}
   %v = tt.descriptor_load %w[%r, %c0] : !tt.tensordesc<1x64xf16> -> tensor<1x64xf16>
   tts.pin %v {memory_space = "ct_local", offset = 4096 : i32} : tensor<1x64xf16>
   tt.return
@@ -199,7 +200,7 @@ tt.func @a_missing_corner(%x: tensor<1x32xf16>) {
     %r = arith.divsi %pid, %c2 : i32
     %m = arith.remsi %pid, %c2 : i32
     %col = arith.muli %m, %c32 : i32
-    // expected-error @+1 {{3 tiles read, and their blocks span 4 places: every place in the box they span must be read for the destination to be whole}}
+    // expected-error @+1 {{3 distinct blocks are read, and they span 4 places: every place in the box they span must be read for the destination to be whole}}
     %v = tt.descriptor_load %w[%r, %col] : !tt.tensordesc<1x32xf16> -> tensor<1x32xf16>
     tts.pin %v {memory_space = "ct_local", offset = 4096 : i32} : tensor<1x32xf16>
   }

@@ -172,3 +172,74 @@ tt.func @not_quasi_affine(%x: tensor<1x64xf16>) {
   tts.pin %v {memory_space = "ct_local", offset = 4096 : i32} : tensor<1x64xf16>
   tt.return
 }
+
+// -----
+// Copies, the design doc's worked example: the even tiles both read the whole
+// [4, 64], and the copies are laid along dimension 0, so the dst view is [8, 64]
+// with tile 0's landing at rows 0-3 and tile 2's at rows 4-7. The dst row is the
+// copy's slab, 4 * (t / 2): no remainder, since t / 2 stays below 2 on all four
+// tiles. The src coordinate is the constant 0 on every tile.
+// CHECK-DAG: #[[COPY0:.*]] = affine_set<(d0, d1) : (d0 >= 0, -d0 + 3 >= 0, d1 >= 0, -d1 + 63 >= 0)>
+// CHECK-DAG: #[[COPY1:.*]] = affine_set<(d0, d1) : (d0 - 4 >= 0, -d0 + 7 >= 0, d1 >= 0, -d1 + 63 >= 0)>
+// CHECK-LABEL: tt.func @gather_onto_the_even_tiles
+// CHECK: %[[SRC:.*]] = ktdp.construct_distributed_memory_view({{.*}}) : memref<4x64xf16>
+// CHECK: %[[L0:.*]] = ktdp.construct_memory_view %{{.*}}, sizes: [4, 64], strides: [64, 1] {coordinate_set = #[[COPY0]], memory_space = #ktdp.memory_space<ct_local, ct_id = 0>}
+// CHECK: %[[L2:.*]] = ktdp.construct_memory_view %{{.*}}, sizes: [4, 64], strides: [64, 1] {coordinate_set = #[[COPY1]], memory_space = #ktdp.memory_space<ct_local, ct_id = 2>}
+// CHECK: %[[DST:.*]] = ktdp.construct_distributed_memory_view(%[[L0]], %[[L2]] : {{.*}}) : memref<8x64xf16>
+// CHECK: %[[ROW:.*]] = arith.index_cast %c0_i32 : i32 to index
+// CHECK: %[[TID:.*]] = arith.index_cast %{{.*}} : i32 to index
+// CHECK: %[[Q:.*]] = arith.divsi %[[TID]], %c2{{.*}} : index
+// CHECK-NOT: arith.remsi {{.*}} : index
+// CHECK: %[[SLAB:.*]] = arith.muli %[[Q]], %c4{{.*}} : index
+// CHECK: %[[DROW:.*]] = arith.addi %[[ROW]], %[[SLAB]] : index
+// CHECK-NOT: arith.select
+// CHECK: ktdp.construct_access_tile %[[SRC]][%[[ROW]], %{{.*}}]
+// CHECK: ktdp.construct_access_tile %[[DST]][%[[DROW]], %{{.*}}]
+tt.func @gather_onto_the_even_tiles(%x: tensor<1x64xf16>) {
+  %share = math.exp %x : tensor<1x64xf16>
+  tts.pin %share {memory_space = "ct_local", offset = 0 : i32} : tensor<1x64xf16>
+  %w = tts.make_distributed_descriptor %share
+      {work_slices = [{mb = 0 : i64}, {mb = 1 : i64}, {mb = 2 : i64}, {mb = 3 : i64}],
+       axes = ["mb", ""], block_shape = array<i64: 4, 64>}
+      : tensor<1x64xf16> -> !tt.tensordesc<4x64xf16>
+  %pid = tt.get_program_id x : i32
+  %c0 = arith.constant 0 : i32
+  %c2 = arith.constant 2 : i32
+  %m = arith.remsi %pid, %c2 : i32
+  %even = arith.cmpi eq, %m, %c0 : i32
+  scf.if %even {
+    %v = tt.descriptor_load %w[%c0, %c0] : !tt.tensordesc<4x64xf16> -> tensor<4x64xf16>
+    tts.pin %v {memory_space = "ct_local", offset = 4096 : i32} : tensor<4x64xf16>
+  }
+  tt.return
+}
+
+// -----
+// Copies whose index needs the remainder: tile t reads rows 2 * (t / 2) .. + 1,
+// so tiles 0 and 1 read one block and tiles 2 and 3 the other, and each block's
+// second copy is on an odd tile: the copy index is t % 2, and the dst row is the
+// src row plus 4 * (t % 2).
+// CHECK-LABEL: tt.func @copy_index_is_a_remainder
+// CHECK: %[[DST:.*]] = ktdp.construct_distributed_memory_view({{.*}}) : memref<8x64xf16>
+// CHECK: %[[ROW:.*]] = arith.index_cast %{{.*}} : i32 to index
+// CHECK: %[[TID:.*]] = arith.index_cast %{{.*}} : i32 to index
+// CHECK: %[[C:.*]] = arith.remsi %[[TID]], %c2{{.*}} : index
+// CHECK: %[[SLAB:.*]] = arith.muli %[[C]], %c4{{.*}} : index
+// CHECK: %[[DROW:.*]] = arith.addi %[[ROW]], %[[SLAB]] : index
+// CHECK: ktdp.construct_access_tile %[[DST]][%[[DROW]], %{{.*}}]
+tt.func @copy_index_is_a_remainder(%x: tensor<1x64xf16>) {
+  %share = math.exp %x : tensor<1x64xf16>
+  tts.pin %share {memory_space = "ct_local", offset = 0 : i32} : tensor<1x64xf16>
+  %w = tts.make_distributed_descriptor %share
+      {work_slices = [{mb = 0 : i64}, {mb = 1 : i64}, {mb = 2 : i64}, {mb = 3 : i64}],
+       axes = ["mb", ""], block_shape = array<i64: 2, 64>}
+      : tensor<1x64xf16> -> !tt.tensordesc<2x64xf16>
+  %pid = tt.get_program_id x : i32
+  %c0 = arith.constant 0 : i32
+  %c2 = arith.constant 2 : i32
+  %h = arith.divsi %pid, %c2 : i32
+  %row = arith.muli %h, %c2 : i32
+  %v = tt.descriptor_load %w[%row, %c0] : !tt.tensordesc<2x64xf16> -> tensor<2x64xf16>
+  tts.pin %v {memory_space = "ct_local", offset = 4096 : i32} : tensor<2x64xf16>
+  tt.return
+}
