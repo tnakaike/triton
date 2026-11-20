@@ -35,17 +35,16 @@ tt.func @unpinned_share(%x: tensor<64x32xf16>) -> tensor<64x32xf16> {
 }
 
 // -----
-// More partitions than the grid has tiles. The holder is the partition's index in
-// the table, which is only the right answer when the table has one entry per tile;
-// resolving a shorter or longer one needs the tile coordinate table, which this op
-// does not carry. Refused rather than guessed, because a guess would put data in a
-// core that does not hold it and nothing downstream could tell.
+// More entries than the grid has tiles. work_slices has one entry per tile and the
+// holder is the entry's position, so a list of another length names tiles that do
+// not exist (or leaves some unnamed). The op cannot see the grid, so the lowering
+// refuses it.
 #id3 = affine_map<(d0, d1) -> (d0, d1)>
 #share3 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 31 >= 0)>
 tt.func @table_longer_than_grid(%x: tensor<64x32xf16>) -> tensor<64x32xf16> {
   %share = math.exp %x : tensor<64x32xf16>
   tts.pin %share {memory_space = "ct_local", offset = 4096 : i32} : tensor<64x32xf16>
-  // expected-error @+1 {{work_slices has 4 partitions for a grid of 2: only one partition per tile is supported}}
+  // expected-error @+1 {{work_slices has 4 entries for a grid of 2: it needs one per tile, None where the tile holds nothing}}
   %w = tts.make_distributed_descriptor %share
       {work_slices = [{n = 0 : i64}, {n = 1 : i64}, {n = 2 : i64}, {n = 3 : i64}],
        axes = ["", "n"], block_shape = array<i64: 64, 32>}
@@ -56,16 +55,16 @@ tt.func @table_longer_than_grid(%x: tensor<64x32xf16>) -> tensor<64x32xf16> {
 }
 
 // -----
-// Fewer partitions than tiles, which is the BROADCAST case -- a source held by one
-// core and read by all of them. Refused by the same rule and worth its own case,
-// because it is the shape a reader is most likely to reach for next: it is
-// expressible in the design and needs the second table, not a different op.
+// Fewer entries than tiles: the BROADCAST source, held by one core, written with
+// only its holder's entry. Refused by the same rule and worth its own case, because
+// it is the shape a reader is most likely to write: the list it needs names the
+// other tile too, as None (`[{n: 0}, None]`; see distributed-view.mlir).
 #id4 = affine_map<(d0, d1) -> (d0, d1)>
 #share4 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 31 >= 0)>
 tt.func @broadcast_source(%x: tensor<64x32xf16>) -> tensor<64x32xf16> {
   %share = math.exp %x : tensor<64x32xf16>
   tts.pin %share {memory_space = "ct_local", offset = 4096 : i32} : tensor<64x32xf16>
-  // expected-error @+1 {{work_slices has 1 partitions for a grid of 2}}
+  // expected-error @+1 {{work_slices has 1 entries for a grid of 2}}
   %w = tts.make_distributed_descriptor %share
       {work_slices = [{n = 0 : i64}],
        axes = ["", "n"], block_shape = array<i64: 64, 32>}

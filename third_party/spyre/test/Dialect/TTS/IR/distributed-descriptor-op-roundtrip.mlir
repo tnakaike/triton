@@ -129,3 +129,21 @@ tt.func @one_partition(%share: tensor<64x32xf16>) {
       : tensor<64x32xf16> -> !tt.tensordesc<64x32xf16>
   tt.return
 }
+
+// ---------------------------------------------------------------------------
+// (f) Strided holders: tiles 0 and 2 hold a region, tiles 1 and 3 nothing.
+//
+//     work_slices has one entry per tile, so a tile that holds nothing is `unit`,
+//     and an entry's position is its holder. The indices under `n` are still
+//     dense, 0 and 1, which is what keeps the composed view contiguous however
+//     sparse its holders are.
+// ---------------------------------------------------------------------------
+// CHECK-LABEL: tt.func @strided_holders(
+// CHECK: work_slices = [{n = 0 : i64}, unit, {n = 1 : i64}, unit]
+tt.func @strided_holders(%share: tensor<64x32xf16>) {
+  %w = tts.make_distributed_descriptor %share
+      {work_slices = [{n = 0 : i64}, unit, {n = 1 : i64}, unit],
+       axes = ["", "n"], block_shape = array<i64: 64, 64>}
+      : tensor<64x32xf16> -> !tt.tensordesc<64x64xf16>
+  tt.return
+}

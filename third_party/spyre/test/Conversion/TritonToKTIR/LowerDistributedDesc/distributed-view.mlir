@@ -64,11 +64,11 @@ tt.func @two_partitions(%x: tensor<64x32xf16>) -> tensor<64x32xf16> {
 }
 
 // -----
-// The table's ORDER is the holder, not its contents. Here partition 0 owns the
+// An entry's POSITION is its holder, not its contents. Here tile 0 holds the
 // SECOND slice, so ct_id 0 carries the set starting at 32 -- which a lowering
 // deriving the holder from the slice index instead would get exactly backwards,
 // and would get backwards invisibly, since both views verify either way. This is
-// the case that pins "holder = the partition's index in the table".
+// the case that pins "holder = the entry's position in the list".
 // CHECK-LABEL: func @holder_is_the_index
 // CHECK: ktdp.construct_memory_view %{{.*}} memory_space = #ktdp.memory_space<ct_local, ct_id = 0>}
 // CHECK: ktdp.construct_memory_view %{{.*}} memory_space = #ktdp.memory_space<ct_local, ct_id = 1>}
@@ -85,6 +85,26 @@ tt.func @holder_is_the_index(%x: tensor<64x32xf16>) -> tensor<64x32xf16> {
   tts.pin %share {memory_space = "ct_local", offset = 4096 : i32} : tensor<64x32xf16>
   %w = tts.make_distributed_descriptor %share
       {work_slices = [{n = 1 : i64}, {n = 0 : i64}],
+       axes = ["", "n"], block_shape = array<i64: 64, 32>}
+      : tensor<64x32xf16> -> !tt.tensordesc<64x32xf16>
+  %c0_i32 = arith.constant 0 : i32
+  %mine = tt.descriptor_load %w[%c0_i32, %c0_i32] : !tt.tensordesc<64x32xf16> -> tensor<64x32xf16>
+  tt.return %mine : tensor<64x32xf16>
+}
+
+// -----
+// A tile that holds nothing is `unit` (the Python None) and contributes no
+// partition: the one view is tile 1's, and the composed view is that one region.
+// INLINE-LABEL: func @a_tile_that_holds_nothing
+// INLINE-NOT: ct_id = 0
+// INLINE: coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 31 >= 0)>, memory_space = #ktdp.memory_space<ct_local, ct_id = 1>
+// INLINE-NOT: ct_id = 0
+// INLINE: ktdp.construct_distributed_memory_view(%{{[^ ]*}} : memref<64x32xf16, #ktdp.memory_space<ct_local, ct_id = 1>>) : memref<64x32xf16>
+tt.func @a_tile_that_holds_nothing(%x: tensor<64x32xf16>) -> tensor<64x32xf16> {
+  %share = math.exp %x : tensor<64x32xf16>
+  tts.pin %share {memory_space = "ct_local", offset = 4096 : i32} : tensor<64x32xf16>
+  %w = tts.make_distributed_descriptor %share
+      {work_slices = [unit, {n = 0 : i64}],
        axes = ["", "n"], block_shape = array<i64: 64, 32>}
       : tensor<64x32xf16> -> !tt.tensordesc<64x32xf16>
   %c0_i32 = arith.constant 0 : i32

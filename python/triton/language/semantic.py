@@ -1923,14 +1923,16 @@ class TritonSemantic(Generic[TensorTy]):
     # --- START --- added for spyre
     @staticmethod
     def _check_work_slices(work_slices, who):
-        """Check a work-slice table: a non-empty list of dicts with identical keys.
+        """Check a work-slice list: one entry per tile, a dict or None, at least one
+        dict, every dict with the same keys.
 
-        Used by `make_distributed_descriptor`, whose table maps a partition to its
-        region. `who` names the caller, since a table is rejected at the kernel line
-        and the message has to say which op rejected it.
+        Used by `make_distributed_descriptor`. `who` names the caller, since a list
+        is rejected at the kernel line and the message has to say which op
+        rejected it.
 
         Not a restatement of `tts`'s own reader: that one runs on the attribute the
-        builder assembled and is what a module parsed from text is checked by. This
+        builder assembled and is what a module parsed from text is checked by (it
+        also checks that no two regions are equal and that indices are dense). This
         one exists so a Python-level mistake -- a tuple, a ragged dict -- is a
         traceback at the call rather than a verifier failure after tracing.
         """
@@ -1939,18 +1941,23 @@ class TritonSemantic(Generic[TensorTy]):
                 f"{who}: work_slices must be a list, got {type(work_slices).__name__!r}")
         if len(work_slices) == 0:
             raise ValueError(f"{who}: work_slices must not be empty")
+        ref_keys = None
         for i, entry in enumerate(work_slices):
+            if entry is None:
+                continue
             if not isinstance(entry, dict):
                 raise ValueError(
-                    f"{who}: work_slices[{i}] must be a dict, "
-                    f"got {type(entry).__name__!r}")
-        ref_keys = set(work_slices[0].keys())
-        for i, entry in enumerate(work_slices[1:], start=1):
-            if set(entry.keys()) != ref_keys:
+                    f"{who}: work_slices[{i}] must be a dict, or None for a tile "
+                    f"that holds nothing, got {type(entry).__name__!r}")
+            if ref_keys is None:
+                ref_keys = set(entry.keys())
+            elif set(entry.keys()) != ref_keys:
                 raise ValueError(
                     f"{who}: work_slices[{i}] has keys "
                     f"{sorted(entry.keys())}, expected {sorted(ref_keys)} "
                     f"(keys must be identical across all tiles)")
+        if ref_keys is None:
+            raise ValueError(f"{who}: work_slices holds no region: every entry is None")
 
     def wk_slice_coord(self, work_slices, axis):
         """Return work_slices[program_id(0)][axis] as a runtime i32 scalar.
@@ -2182,13 +2189,20 @@ class TritonSemantic(Generic[TensorTy]):
                     f"or None, got {axis!r}")
 
         # Flat parallel lists: the key order is fixed once here so every entry is
-        # serialized against it.
-        ws_keys = [str(k) for k in work_slices[0].keys()]
-        ws_vals = [[int(entry[k]) for k in ws_keys] for entry in work_slices]
+        # serialized against it. A tile that holds nothing is `ws_present` False,
+        # with no values, and becomes `unit` in the attribute. `ws_present` is
+        # needed besides `ws_vals`: a holder of `{}` (the whole, undivided) also
+        # has no values, so `[{}, None]` and `[None, {}]` would both serialize to
+        # `ws_vals == [[], []]` and lose which tile is the holder.
+        holder = next(entry for entry in work_slices if entry is not None)
+        ws_keys = [str(k) for k in holder.keys()]
+        ws_present = [entry is not None for entry in work_slices]
+        ws_vals = [[] if entry is None else [int(entry[k]) for k in ws_keys]
+                   for entry in work_slices]
 
         from triton._C.libtriton import spyre
         handle = spyre.ir_builders.create_make_distributed_descriptor(
-            self.builder, partial.handle, ws_keys, ws_vals, axis_strs,
+            self.builder, partial.handle, ws_keys, ws_present, ws_vals, axis_strs,
             [int(b) for b in block_shape])
 
         block_ty = tl.block_type(partial.dtype, [int(b) for b in block_shape])

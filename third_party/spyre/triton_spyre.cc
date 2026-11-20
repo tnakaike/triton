@@ -186,7 +186,7 @@ void init_triton_spyre_ir_builders(py::module &&m) {
   m.def(
       "create_make_distributed_descriptor",
       [](TritonOpBuilder &self, mlir::Value &partial,
-         std::vector<std::string> &ws_keys,
+         std::vector<std::string> &ws_keys, std::vector<bool> &ws_present,
          std::vector<std::vector<int64_t>> &ws_vals,
          std::vector<std::string> &axes,
          std::vector<int64_t> &block_shape) -> mlir::Value {
@@ -197,7 +197,12 @@ void init_triton_spyre_ir_builders(py::module &&m) {
         auto i64Ty = builder.getI64Type();
 
         llvm::SmallVector<mlir::Attribute> tableAttrs;
-        for (auto &vals : ws_vals) {
+        for (auto [present, vals] : llvm::zip_equal(ws_present, ws_vals)) {
+          if (!present) {
+            // A tile that holds nothing: `unit`, the Python `None`.
+            tableAttrs.push_back(mlir::UnitAttr::get(ctx));
+            continue;
+          }
           llvm::SmallVector<mlir::NamedAttribute> entry;
           for (size_t j = 0; j < ws_keys.size(); ++j)
             entry.push_back({mlir::StringAttr::get(ctx, ws_keys[j]),
@@ -226,7 +231,8 @@ void init_triton_spyre_ir_builders(py::module &&m) {
             .getResult();
       },
       py::arg("builder"), py::arg("partial"), py::arg("ws_keys"),
-      py::arg("ws_vals"), py::arg("axes"), py::arg("block_shape"));
+      py::arg("ws_present"), py::arg("ws_vals"), py::arg("axes"),
+      py::arg("block_shape"));
 }
 
 /// One `tts.tensor_layout` marker, reduced to what a footprint is computed from.

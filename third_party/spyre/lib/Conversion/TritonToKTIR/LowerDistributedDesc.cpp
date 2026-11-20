@@ -100,28 +100,22 @@ lowerDistributedDescriptor(triton::tts::MakeDistributedDescriptorOp op,
   ArrayRef<int64_t> shareShape = shareTy.getShape();
   unsigned rank = shareShape.size();
 
-  // --- the partition table, through the op's own reader -----------------------
-  SmallVector<triton::tts::WorkSliceEntry> entries;
+  // --- the work-slice list, through the op's own reader ----------------------
+  SmallVector<std::optional<triton::tts::WorkSliceEntry>> entries;
   llvm::MapVector<StringRef, int64_t> sliceCounts;
   auto emitError = [&]() { return op.emitError(); };
   if (failed(triton::tts::readWorkSliceTable(op.getWorkSlices(), entries, sliceCounts,
                                      emitError)))
     return failure();
 
-  // Holder = the partition's index in the table. §1 resolves a holder by matching
-  // the partition's coordinate dict against the tile -> coordinate table, which
-  // is a second table this op does not carry; the two coincide exactly when the
-  // table has one entry per tile, and then the match is the identity. Anything
-  // else -- a tensor held by 8 of 32 cores, or a broadcast source of 1 -- needs
-  // that second table, and is refused here rather than resolved by a guess about
-  // which cores were meant.
+  // One entry per tile, so the holder is the entry's position (§1). A tile that
+  // holds nothing is `unit` and contributes no partition. The length is a claim
+  // about the launch grid, which the op cannot see, so it is checked here.
   if ((int64_t)entries.size() != cores)
     return op.emitError()
-           << "work_slices has " << entries.size() << " partitions for a grid of "
+           << "work_slices has " << entries.size() << " entries for a grid of "
            << cores
-           << ": only one partition per tile is supported, since the holder is "
-              "then the partition's own index. A shorter table needs the tile "
-              "coordinate table to resolve holders against";
+           << ": it needs one per tile, None where the tile holds nothing";
 
   // --- where the share lives, read off the pin -------------------------------
   // The MARKER OP, not the `tts.pin` attribute. This pass runs before
@@ -190,8 +184,10 @@ lowerDistributedDescriptor(triton::tts::MakeDistributedDescriptorOp op,
   }
 
   SmallVector<Value> partitions;
-  partitions.reserve(entries.size());
-  for (auto [id, entry] : llvm::enumerate(entries)) {
+  for (auto [id, maybeEntry] : llvm::enumerate(entries)) {
+    if (!maybeEntry)
+      continue;
+    const triton::tts::WorkSliceEntry &entry = *maybeEntry;
     // The region this partition owns, in the composed tensor's index space.
     SmallVector<int64_t> los(rank, 0), his(wholeShape.begin(), wholeShape.end());
     for (unsigned d = 0; d < rank; ++d) {

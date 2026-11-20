@@ -3936,13 +3936,15 @@ def make_distributed_descriptor(partial, work_slices, axes, block_shape,
 
     Args:
         partial:     This instance's share, a value. It must be pinned.
-        work_slices: The PARTITION table — one entry per region the view is
-                     composed from, NOT one per tile — as a ``tl.constexpr`` list
-                     of dicts mapping a dimension key to a slice index, every
-                     entry carrying the same keys. Written the way
-                     :func:`wk_slice_coord`'s ``work_slices`` is. The slice count
-                     along a key is one more than the largest index appearing
-                     under it, and is deliberately not written down.
+        work_slices: Which tile holds which region, as a ``tl.constexpr`` list
+                     with ONE ENTRY PER TILE, so an entry's position is its
+                     holder: a dict mapping a dimension key to a slice index for
+                     a tile that holds a region, ``None`` for one that holds
+                     none, and ``{}`` for a single holder of the whole, undivided.
+                     Every dict carries the same keys and no two are equal. The
+                     slice count along a key is one more than the largest index
+                     under it, and is deliberately not written down; the indices
+                     under a key are dense, 0 .. n-1 with no gap.
         axes:        One entry per tensor dimension, naming the partition key that
                      dimension is divided along, or ``None`` for a dimension the
                      work was not divided on.

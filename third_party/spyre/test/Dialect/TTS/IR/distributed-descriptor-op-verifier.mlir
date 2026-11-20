@@ -4,9 +4,9 @@
 //
 // Every rule below is answerable from the op alone: the table's form, and whether
 // `axes` and `block_shape` agree with it and with the share. What the op cannot
-// see is the launch grid -- so whether the table has one entry per TILE, which is
-// how a holder is resolved, is the lowering's rule and is tested with it in
-// Conversion/TritonToKTIR/LowerDistributedDesc/.
+// see is the launch grid -- so whether the list has one entry per TILE, which is
+// what makes an entry's position its holder, is the lowering's rule and is tested
+// with it in Conversion/TritonToKTIR/LowerDistributedDesc/.
 //
 // The table rules are `tts::readWorkSliceTable`'s, shared with that lowering, so
 // each message below is the one a hand-written module and a generated one both
@@ -20,7 +20,7 @@
 // Note there are no rules of dashes anywhere in this file, and no comment quotes
 // the split marker: -split-input-file matches it as a substring.
 
-// An empty table composes nothing, so there is no view to build.
+// An empty list names no tile, so there is no view to build.
 tt.func @empty_table(%share: tensor<64x32xf16>) {
   // expected-error @+1 {{work_slices must not be empty}}
   %w = tts.make_distributed_descriptor %share
@@ -30,8 +30,8 @@ tt.func @empty_table(%share: tensor<64x32xf16>) {
 }
 
 // -----
-// Ragged keys. Every entry is one partition's grid coordinate, so a differing key
-// set describes no grid at all.
+// Ragged keys. Every holder's entry is its grid coordinate, so a differing key set
+// describes no grid at all.
 tt.func @ragged_keys(%share: tensor<64x32xf16>) {
   // expected-error @+1 {{work_slices[1] has keys [m], expected [n]: every entry describes the same grid, so the keys must be identical}}
   %w = tts.make_distributed_descriptor %share
@@ -55,13 +55,62 @@ tt.func @negative_index(%share: tensor<64x32xf16>) {
 }
 
 // -----
-// An entry must be a dictionary. Rejected before anything reads it as one, so the
-// message names the table rather than reporting a cast failure.
+// An entry must be a dictionary, or unit for a tile that holds nothing. Rejected
+// before anything reads it as one, so the message names the list rather than
+// reporting a cast failure.
 tt.func @entry_not_a_dict(%share: tensor<64x32xf16>) {
-  // expected-error @+1 {{work_slices[0] must be a dictionary of dimension key to slice index}}
+  // expected-error @+1 {{work_slices[0] must be a dictionary of dimension key to slice index, or unit for a tile that holds nothing}}
   %w = tts.make_distributed_descriptor %share
       {work_slices = [0 : i64], axes = ["", "n"],
        block_shape = array<i64: 64, 32>}
+      : tensor<64x32xf16> -> !tt.tensordesc<64x32xf16>
+  tt.return
+}
+
+// -----
+// Every tile holds nothing: there is no region to compose.
+tt.func @no_holder(%share: tensor<64x32xf16>) {
+  // expected-error @+1 {{work_slices holds no region: every entry is unit}}
+  %w = tts.make_distributed_descriptor %share
+      {work_slices = [unit, unit], axes = ["", "n"],
+       block_shape = array<i64: 64, 32>}
+      : tensor<64x32xf16> -> !tt.tensordesc<64x32xf16>
+  tt.return
+}
+
+// -----
+// Two tiles naming the same region. A view's regions are disjoint, so each is held
+// by one tile.
+tt.func @two_holders_of_one_region(%share: tensor<64x32xf16>) {
+  // expected-error @+1 {{work_slices[2] and work_slices[0] name the same region: a view's regions are disjoint, so each is held by one tile}}
+  %w = tts.make_distributed_descriptor %share
+      {work_slices = [{n = 0 : i64}, {n = 1 : i64}, {n = 0 : i64}],
+       axes = ["", "n"], block_shape = array<i64: 64, 32>}
+      : tensor<64x32xf16> -> !tt.tensordesc<64x32xf16>
+  tt.return
+}
+
+// -----
+// The whole, undivided, is `{}`, and only one tile can hold it: a second `{}` is
+// the same region again.
+tt.func @two_holders_of_the_whole(%share: tensor<64x32xf16>) {
+  // expected-error @+1 {{work_slices[1] and work_slices[0] name the same region}}
+  %w = tts.make_distributed_descriptor %share
+      {work_slices = [{}, {}], axes = ["", ""],
+       block_shape = array<i64: 64, 32>}
+      : tensor<64x32xf16> -> !tt.tensordesc<64x32xf16>
+  tt.return
+}
+
+// -----
+// A gap in the indices under a key. The slice count is one more than the largest
+// index, so index 1 missing under a count of 3 would leave a hole in the composed
+// view.
+tt.func @index_gap(%share: tensor<64x32xf16>) {
+  // expected-error @+1 {{work_slices has no entry with 'n' = 1, though 2 appears: the indices under a key run 0 .. n-1 with no gap}}
+  %w = tts.make_distributed_descriptor %share
+      {work_slices = [{n = 0 : i64}, unit, {n = 2 : i64}],
+       axes = ["", "n"], block_shape = array<i64: 64, 32>}
       : tensor<64x32xf16> -> !tt.tensordesc<64x32xf16>
   tt.return
 }

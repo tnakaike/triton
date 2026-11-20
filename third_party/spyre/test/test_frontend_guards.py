@@ -645,6 +645,16 @@ class TestMakeDistributedDescriptor(TestSpyrePin):
         self._refuses(self._kernel([0], [None, "n"], [64, 32]),
                       "work_slices[0] must be a dict")
 
+    def test_a_tile_that_holds_nothing_is_none(self):
+        # One entry per tile, so a tile that holds nothing is None, and it reaches
+        # the IR as `unit` at its own position.
+        ttir = self._kernel([None, {"n": 0}], [None, "n"], [64, 32])()
+        assert "work_slices = [unit, {n = 0 : i64}]" in ttir
+
+    def test_a_list_of_only_none_is_refused(self):
+        self._refuses(self._kernel([None, None], [None, "n"], [64, 32]),
+                      "work_slices holds no region: every entry is None")
+
     def test_axes_length_is_the_rank(self):
         # Per tensor DIMENSION, not per key — so a one-entry axes for a rank-2
         # share is wrong even though there is one key.

@@ -125,20 +125,29 @@ LogicalResult PinOp::verify() {
 //===----------------------------------------------------------------------===//
 
 LogicalResult readWorkSliceTable(
-    ArrayAttr table, SmallVectorImpl<WorkSliceEntry> &entries,
+    ArrayAttr table, SmallVectorImpl<std::optional<WorkSliceEntry>> &entries,
     llvm::MapVector<StringRef, int64_t> &sliceCounts,
     llvm::function_ref<InFlightDiagnostic()> emitError) {
   if (table.empty())
-    return emitError() << "work_slices must not be empty: a view is composed "
-                          "from at least one partition";
+    return emitError() << "work_slices must not be empty: it has one entry per "
+                          "tile";
 
   SmallVector<StringRef> refKeys;
+  bool sawHolder = false;
+  // For the duplicate check: the sorted (key, index) sequence of each holder.
+  SmallVector<std::pair<WorkSliceEntry, size_t>> seen;
+  // For the density check: the indices seen under each key.
+  llvm::MapVector<StringRef, llvm::SmallDenseSet<int64_t>> indicesPerKey;
   for (auto [i, attr] : llvm::enumerate(table)) {
+    if (isa<UnitAttr>(attr)) {
+      entries.push_back(std::nullopt);
+      continue;
+    }
     auto dict = dyn_cast<DictionaryAttr>(attr);
     if (!dict)
       return emitError() << "work_slices[" << i
                          << "] must be a dictionary of dimension key to slice "
-                            "index";
+                            "index, or unit for a tile that holds nothing";
 
     WorkSliceEntry entry;
     for (NamedAttribute named : dict) {
@@ -154,13 +163,13 @@ LogicalResult readWorkSliceTable(
       entry.emplace_back(named.getName().strref(), idx.getInt());
     }
 
-    // Same key SET in every entry, checked as a sorted sequence because a
-    // DictionaryAttr is already sorted by name -- so equality of the two
+    // Same key SET in every holder's entry, checked as a sorted sequence because
+    // a DictionaryAttr is already sorted by name -- so equality of the two
     // sequences is equality of the sets, with no set to build.
     SmallVector<StringRef> keys;
     for (auto &[key, _] : entry)
       keys.push_back(key);
-    if (i == 0) {
+    if (!sawHolder) {
       refKeys = keys;
     } else if (keys != refKeys) {
       auto diag = emitError() << "work_slices[" << i << "] has keys [";
@@ -170,8 +179,18 @@ LogicalResult readWorkSliceTable(
       return diag << "]: every entry describes the same grid, so the keys must "
                      "be identical";
     }
+    sawHolder = true;
+
+    // No two holders hold the same region.
+    for (auto &[other, j] : seen)
+      if (other == entry)
+        return emitError() << "work_slices[" << i << "] and work_slices[" << j
+                           << "] name the same region: a view's regions are "
+                              "disjoint, so each is held by one tile";
+    seen.push_back({entry, i});
 
     for (auto &[key, index] : entry) {
+      indicesPerKey[key].insert(index);
       auto it = sliceCounts.find(key);
       if (it == sliceCounts.end())
         sliceCounts.insert({key, index + 1});
@@ -180,6 +199,19 @@ LogicalResult readWorkSliceTable(
     }
     entries.push_back(std::move(entry));
   }
+  if (!sawHolder)
+    return emitError() << "work_slices holds no region: every entry is unit";
+
+  // Dense indices: under each key every index below the count occurs.
+  for (auto &[key, indices] : indicesPerKey) {
+    int64_t count = sliceCounts.find(key)->second;
+    for (int64_t index = 0; index < count; ++index)
+      if (!indices.contains(index))
+        return emitError() << "work_slices has no entry with '" << key
+                           << "' = " << index << ", though " << (count - 1)
+                           << " appears: the indices under a key run 0 .. n-1 "
+                              "with no gap";
+  }
   return success();
 }
 
@@ -187,8 +219,8 @@ LogicalResult MakeDistributedDescriptorOp::verify() {
   auto tensorTy = cast<RankedTensorType>(getPartial().getType());
   unsigned rank = tensorTy.getRank();
 
-  // (1) The partition table, through the shared reader.
-  SmallVector<WorkSliceEntry> entries;
+  // (1) The work-slice list, through the shared reader.
+  SmallVector<std::optional<WorkSliceEntry>> entries;
   llvm::MapVector<StringRef, int64_t> sliceCounts;
   auto emitError = [&]() { return this->emitOpError(); };
   if (failed(readWorkSliceTable(getWorkSlices(), entries, sliceCounts,

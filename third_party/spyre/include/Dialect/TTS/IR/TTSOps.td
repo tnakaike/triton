@@ -163,12 +163,14 @@ def TTS_MakeDistributedDescriptorOp
     The attributes, and note there is no destination table -- the destination
     arrangement is the offset each instance passes to `.load()`:
 
-      work_slices  the PARTITION table, one entry per region the view is composed
-                   from, NOT one per tile. Each entry is a dictionary of
-                   dimension key to slice index, all entries carrying the same
-                   keys, spelled as `tl.wk_slice_coord`'s `work_slices` is. The slice
+      work_slices  one entry PER TILE, so an entry's position is its holder: a
+                   dictionary of dimension key to slice index for a tile that
+                   holds a region, and `unit` (the Python `None`) for a tile
+                   that holds none. Every dictionary carries the same keys and
+                   no two are equal, since no two regions overlap. The slice
                    count along a key is one more than the largest index appearing
-                   under it, and is deliberately not written down.
+                   under it, and is deliberately not written down; the indices
+                   under a key are dense, 0 .. n-1 with no gap.
       axes         one entry per tensor dimension, naming the partition key that
                    dimension is divided along, or `""` for a dimension the work
                    was not divided on.

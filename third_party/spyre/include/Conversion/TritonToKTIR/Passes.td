@@ -195,8 +195,8 @@ def LowerDistributedDesc : Pass<"lower-distributed-desc", "mlir::ModuleOp"> {
         "mlir::arith::ArithDialect"
     ];
 
-    // A compose has to decide whether its partition table has one entry per
-    // TILE -- a claim about the launch grid, unanswerable from the table alone.
+    // `work_slices` has one entry per TILE, a claim about the launch grid that
+    // the op cannot check, so the lowering checks it against this.
     let options = [
         ListOption<"grid", "grid", "int64_t",
                    "Per-axis partition of the Spyre hardware grid, as "
