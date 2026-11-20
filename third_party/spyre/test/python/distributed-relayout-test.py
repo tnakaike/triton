@@ -17,10 +17,14 @@ The kernel is the smallest thing that is a real redistribution:
 
 Both pins are load-bearing and for different reasons, which is the point of testing
 them here rather than apart. The first is the only thing that gives a partition an
-offset — the compose refuses a share nothing pinned. The second is the landing the
-design requires before a compute unit may read a received tile, and it is honoured by
-`MaterializePinnedBuffers` in the `spyrecode` stage rather than by the compose, so
-nothing but an end-to-end run shows the two agreeing about it.
+offset — the compose refuses a share nothing pinned — and it is honoured by
+`MaterializePinnedBuffers` in the `spyrecode` stage. The second is the landing the
+design requires before a compute unit may read a received tile. `AnalyzeDistributedDesc`
+reads which tiles receive and where each block sits in the destination, and
+`LowerDistributedDesc` consumes the pin: it composes the landings into a dst view and
+emits the transfer as a load from the src view and a store into the dst view. So the
+landing is in the `ktir` stage already, and the share's store a stage later, and
+nothing but an end-to-end run shows the two agreeing.
 
 What is NOT checked here is numerical: this cannot reach a device. dbo's V1 legality
 check rejects `construct_distributed_memory_view` outright, and a hand-written
@@ -28,7 +32,7 @@ check rejects `construct_distributed_memory_view` outright, and a hand-written
 `applicable_units` attribute. So the artifact is read instead, at the `ktir` stage,
 which is also where `PLAN-DistDesc.md` puts this layer's acceptance.
 
-Three claims, and they are separable.
+Four claims, and they are separable.
 
 **The partitions differ only in coordinate_set and ct_id.** Design section 3 says
 those two attributes are "the entire content of the distribution", so the offsets
@@ -42,10 +46,15 @@ composition of two of them is [64, 64]. That number appears nowhere in the kerne
 the slice count is derived as one more than the largest index in the table — so it is
 the derivation being checked and not a transcription.
 
-**The read is per-instance.** The access tile's offset is `pid * N`, which is what
-makes this a redistribution rather than 32 copies of the same read. It stays an SSA
-value through the lowering, because `construct_access_tile` takes runtime base
-indices.
+**The read is per-instance.** The access tile's coordinate is `pid * N`, which is
+what makes this a redistribution rather than copies of the same read. It is
+quasi-affine in the program id, so the lowering keeps the read's own expression,
+an SSA value, because `construct_access_tile` takes runtime base indices.
+
+**The received tile lands in a composed dst view.** Each tile receives, so the dst
+view composes two landings at the landing's offset, one per core, and the store of the
+transfer goes into it. Here every tile receives the region it already holds, so the
+dst view has the src view's extent and the same coordinate sets.
 """
 
 import pytest
@@ -122,11 +131,12 @@ def ktir():
 def spyrecode():
     """The same kernel through BOTH stages, as printed IR.
 
-    The `ktir` fixture above stops where that stage does, and the two pins are still
-    attributes there: `LowerTTSMarkers` moved them onto their producers and
+    The `ktir` fixture above stops where that stage does, and the share's pin is
+    still an attribute there: `LowerTTSMarkers` moved it onto its producer and
     `MaterializePinnedBuffers` -- which builds the buffer, the store and the loads --
-    runs at the head of `spyrecode`. So anything about a pin's BUFFER has to be asked
-    of this fixture, and anything about the compose can be asked of either.
+    runs at the head of `spyrecode`. So anything about the share's BUFFER has to be
+    asked of this fixture. The landing's pin is consumed a stage earlier, by
+    `LowerDistributedDesc`, so its store and its read-back are in both.
 
     That split is the whole reason this file exists. The compose is emitted by one
     pass in one stage and the buffers it names are built by another pass in the next,
@@ -161,19 +171,42 @@ def _views(ktir, needle):
             if "ktdp.construct_memory_view" in line and needle in line]
 
 
+def _composes(ktir):
+    """Each `construct_distributed_memory_view` as (result name, operand names,
+    line), in program order: the src view first, made where the descriptor was, then
+    the dst view, made where the read was."""
+    out = []
+    for line in ktir.splitlines():
+        if "construct_distributed_memory_view(" not in line:
+            continue
+        name = line.split(" =")[0].strip()
+        operands = line.split("(", 1)[1].split(":")[0]
+        out.append((name, [o.strip() for o in operands.split(",")], line))
+    return out
+
+
+def _partitions(ktir, which):
+    """The memory views composed by the `which`-th compose (0 = src, 1 = dst)."""
+    _, operands, _ = _composes(ktir)[which]
+    return [line.strip() for line in ktir.splitlines()
+            if "ktdp.construct_memory_view" in line
+            and line.split(" =")[0].strip() in operands]
+
+
 class TestTheComposedView:
 
     def test_one_partition_per_tile(self, ktir):
         # Two cores, two partitions, each naming a different core's scratchpad.
-        assert len(_views(ktir, "ct_id = 0")) == 1
-        assert len(_views(ktir, "ct_id = 1")) == 1
+        src = _partitions(ktir, 0)
+        assert len([v for v in src if "ct_id = 0" in v]) == 1, src
+        assert len([v for v in src if "ct_id = 1" in v]) == 1, src
 
     def test_the_partitions_share_one_offset(self, ktir):
         # The claim that matters most, and the one a wrong lowering would pass every
         # other check with. Compared as the offset TOKEN rather than a number,
         # because the value is an SSA name.
         offsets = [line.split("construct_memory_view ")[1].split(",")[0]
-                   for line in _views(ktir, "ct_id =")]
+                   for line in _partitions(ktir, 0)]
         assert len(set(offsets)) == 1, offsets
 
     def test_the_partitions_differ_only_in_set_and_ct_id(self, ktir):
@@ -188,7 +221,9 @@ class TestTheComposedView:
             _, _, tail = rest.partition(",")
             return head + "coordinate_set = _," + tail
 
-        a, b = _views(ktir, "ct_id = 0")[0], _views(ktir, "ct_id = 1")[0]
+        src = _partitions(ktir, 0)
+        a = next(v for v in src if "ct_id = 0" in v)
+        b = next(v for v in src if "ct_id = 1" in v)
         assert strip(a, 0) == strip(b, 1)
         # And they really do differ before normalising, or the assertion above
         # proves nothing.
@@ -211,8 +246,7 @@ class TestTheComposedView:
         # [64, 32] composed twice is [64, 64], and 64 appears in no kernel line: the
         # slice count is derived from the table.
         assert "ktdp.construct_distributed_memory_view" in ktir
-        compose = [line for line in ktir.splitlines()
-                   if "construct_distributed_memory_view" in line][0]
+        _, _, compose = _composes(ktir)[0]
         assert ": memref<64x64xf16>" in compose
 
     def test_the_marker_is_gone(self, ktir):
@@ -223,9 +257,7 @@ class TestTheComposedView:
 class TestTheTransfer:
 
     def test_the_read_is_on_the_composed_view(self, ktir):
-        compose = [line for line in ktir.splitlines()
-                   if "construct_distributed_memory_view" in line][0]
-        name = compose.split(" =")[0].strip()
+        name, _, _ = _composes(ktir)[0]
         tiles = [line for line in ktir.splitlines()
                  if "construct_access_tile" in line and f"{name}[" in line]
         assert len(tiles) == 1, tiles
@@ -233,29 +265,88 @@ class TestTheTransfer:
         # from the whole.
         assert "memref<64x64xf16> -> !ktdp.access_tile<64x32xindex>" in tiles[0]
 
-    def test_the_offset_is_per_instance(self, ktir):
-        # pid * N survives as arithmetic on the compute-tile id, so the 32 instances
-        # read 32 different regions of one view. A folded constant here would mean
-        # every core read the same thing.
+    def test_the_coordinate_is_per_instance(self, ktir):
+        # pid * N is quasi-affine, so the lowering uses the read's own expression:
+        # arithmetic on the compute-tile id, and the two instances read two
+        # different regions of one view. A folded constant here would mean every
+        # core read the same thing.
         assert "ktdp.get_compute_tile_id" in ktir
-        assert "arith.muli" in ktir
+        name, _, _ = _composes(ktir)[0]
+        tile = next(line for line in ktir.splitlines()
+                    if "construct_access_tile" in line and f"{name}[" in line)
+        coord = tile.split(f"{name}[")[1].split("]")[0].split(",")[1].strip()
+
+        def definition(value):
+            return next(line for line in ktir.splitlines()
+                        if line.strip().startswith(f"{value} = "))
+        line = definition(coord)
+        if "arith.index_cast" in line:
+            line = definition(line.split("arith.index_cast ")[1].split(" ")[0])
+        assert "arith.muli" in line, line
+        assert "arith.select" not in ktir
+
+    def test_the_transfer_stores_into_the_dst_view(self, ktir):
+        # The landing of design section 3 phase 4: the transfer's load is followed by
+        # a store through the composed dst view, at this tile's dst coordinate.
+        loads = [line for line in ktir.splitlines() if "ktdp.load" in line]
+        dst, _, _ = _composes(ktir)[1]
+        tile = next(line for line in ktir.splitlines()
+                    if "construct_access_tile" in line and f"{dst}[" in line)
+        tile_name = tile.split(" =")[0].strip()
+        store = next(line for line in ktir.splitlines()
+                     if "ktdp.store" in line and tile_name in line)
+        moved = store.split("ktdp.store ")[1].split(",")[0]
+        assert any(line.strip().startswith(f"{moved} = ") for line in loads), store
+
+    def test_the_transfer_is_not_guarded(self, ktir):
+        # The `if` that chooses the receivers does not reach KTIR (design section 3
+        # phase 4). This kernel has none, so there is no scf.if at all.
+        assert "scf.if" not in ktir
+
+
+class TestTheDstView:
+
+    def test_one_landing_per_receiver(self, ktir):
+        # Both tiles receive, so the dst view composes two landings, one per core.
+        dst = _partitions(ktir, 1)
+        assert len([v for v in dst if "ct_id = 0" in v]) == 1, dst
+        assert len([v for v in dst if "ct_id = 1" in v]) == 1, dst
+
+    def test_the_landings_are_at_the_landing_offset(self, ktir):
+        # Every landing sits at the landing pin's offset, and that is not the share's
+        # offset, or the relayout would overwrite its own source.
+        def offset(line):
+            return line.split("construct_memory_view ")[1].split(",")[0]
+        dst = {offset(v) for v in _partitions(ktir, 1)}
+        src = {offset(v) for v in _partitions(ktir, 0)}
+        assert len(dst) == 1, dst
+        assert dst != src, (dst, src)
+
+    def test_the_dst_extent_is_the_union(self, ktir):
+        # Each tile receives a [64, 32] block at [0, 32 * pid], so the dst view is
+        # their union, [64, 64].
+        _, _, compose = _composes(ktir)[1]
+        assert ": memref<64x64xf16>" in compose
 
 
 class TestTheTwoPins:
-    """The pins' BUFFERS, so every test here reads the `spyrecode` fixture.
+    """The pins' BUFFERS, so the tests here read the `spyrecode` fixture.
 
-    In the `ktir` artifact a pin is still an attribute on its producer -- that is the
-    two-stage design -- so asking the `ktir` stage about a store would be asking the
-    wrong stage. An earlier revision of this file did, and it is worth recording what
+    In the `ktir` artifact the share's pin is still an attribute on its producer --
+    that is the two-stage design -- so asking the `ktir` stage about the share's
+    store would be asking the wrong stage. (The landing's store is in the `ktir`
+    stage already; TestTheTransfer checks it there.) An earlier revision of this file
+    asked the `ktir` stage about both, and it is worth recording what
     that cost: one test failed honestly, and one PASSED for the wrong reason, matching
     the kernel's own `out_desc.store` rather than any landing.
     """
 
-    def test_the_pin_is_an_attribute_in_the_ktir_artifact(self, ktir):
-        # The premise of everything below: the `ktir` stage carries the request, not
-        # the buffer. If this ever fails, materialization has moved back and the rest
-        # of this class is asking the wrong stage again.
-        assert "tts.pin = {" in ktir
+    def test_the_share_pin_is_an_attribute_in_the_ktir_artifact(self, ktir):
+        # The premise of the share's tests below: the `ktir` stage carries the
+        # share's request, not its buffer. If this ever fails, materialization has
+        # moved back and those tests are asking the wrong stage again. The landing's
+        # pin is not here: LowerDistributedDesc consumed it.
+        assert ktir.count("tts.pin = {") == 1
         assert "ktdp.store" not in ktir.split("construct_distributed_memory_view")[0]
 
     def test_the_share_is_stored_before_it_is_composed(self, spyrecode):
@@ -270,9 +361,8 @@ class TestTheTwoPins:
         assert store < compose, "the share is composed before anything wrote it"
 
     def test_the_received_tile_lands(self, spyrecode):
-        # The mandatory landing of design section 3 phase 3, and it is the SECOND
-        # pin's store rather than anything the compose emitted -- which is why an
-        # end-to-end test is the only place the two passes can be seen agreeing.
+        # The mandatory landing of design section 3 phase 4 survives the second
+        # stage: after the transfer's load there is a store.
         lines = spyrecode.splitlines()
         compose = next(i for i, l in enumerate(lines)
                        if "construct_distributed_memory_view" in l)
@@ -282,8 +372,10 @@ class TestTheTwoPins:
             "the received tile was never stored"
 
     def test_the_landing_is_its_own_buffer(self, spyrecode):
-        # Two ct_local views with no ct_id: the share's and the landing's. They must be
-        # distinct buffers, or the relayout would overwrite its own source.
+        # Two ct_local views with no ct_id: the share's, built by
+        # MaterializePinnedBuffers, and the landing's, which the read is read back
+        # from. They must be distinct buffers, or the relayout would overwrite its own
+        # source.
         own = _views(spyrecode, "memory_space = #ktdp.memory_space<ct_local>}")
         assert len(own) == 2, own
         offsets = [line.split("construct_memory_view ")[1].split(",")[0] for line in own]

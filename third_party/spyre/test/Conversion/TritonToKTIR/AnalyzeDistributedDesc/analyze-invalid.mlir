@@ -205,3 +205,26 @@ tt.func @a_missing_corner(%x: tensor<1x32xf16>) {
   }
   tt.return
 }
+
+// -----
+// The descriptor made inside the if that guards the read. It is a collective that
+// every tile makes, and the transfer goes ahead of the if, where it does not exist.
+tt.func @descriptor_inside_the_guard(%x: tensor<1x64xf16>) {
+  %share = math.exp %x : tensor<1x64xf16>
+  tts.pin %share {memory_space = "ct_local", offset = 0 : i32} : tensor<1x64xf16>
+  %pid = tt.get_program_id x : i32
+  %c0 = arith.constant 0 : i32
+  %c2 = arith.constant 2 : i32
+  %lt = arith.cmpi slt, %pid, %c2 : i32
+  // expected-note @+1 {{this if}}
+  scf.if %lt {
+    %w = tts.make_distributed_descriptor %share
+        {work_slices = [{mb = 0 : i64}, {mb = 1 : i64}, {mb = 2 : i64}, {mb = 3 : i64}],
+         axes = ["mb", ""], block_shape = array<i64: 1, 64>}
+        : tensor<1x64xf16> -> !tt.tensordesc<1x64xf16>
+    // expected-error @+1 {{the distributed descriptor this reads through is made inside an if that guards the read; every tile makes the descriptor, so make it outside}}
+    %v = tt.descriptor_load %w[%pid, %c0] : !tt.tensordesc<1x64xf16> -> tensor<1x64xf16>
+    tts.pin %v {memory_space = "ct_local", offset = 4096 : i32} : tensor<1x64xf16>
+  }
+  tt.return
+}

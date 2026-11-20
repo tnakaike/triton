@@ -94,3 +94,22 @@ tt.func @store_through_the_view(%x: tensor<64x32xf16>, %val: tensor<64x32xf16>) 
   tt.descriptor_store %w[%c0_i32, %c0_i32], %val : !tt.tensordesc<64x32xf16>, tensor<64x32xf16>
   tt.return
 }
+
+// -----
+
+// A read whose value a pin lands, with no tts.dist_landing on the pin: the
+// lowering needs the analysis' result to compose the dst view, and this file runs
+// the lowering alone.
+tt.func @landing_without_analysis(%x: tensor<64x32xf16>) -> tensor<64x32xf16> {
+  %share = math.exp %x : tensor<64x32xf16>
+  tts.pin %share {memory_space = "ct_local", offset = 4096 : i32} : tensor<64x32xf16>
+  %w = tts.make_distributed_descriptor %share
+      {work_slices = [{n = 0 : i64}, {n = 1 : i64}],
+       axes = ["", "n"], block_shape = array<i64: 64, 32>}
+      : tensor<64x32xf16> -> !tt.tensordesc<64x32xf16>
+  %c0_i32 = arith.constant 0 : i32
+  %mine = tt.descriptor_load %w[%c0_i32, %c0_i32] : !tt.tensordesc<64x32xf16> -> tensor<64x32xf16>
+  // expected-error @+1 {{this pin lands a read through a distributed descriptor, but carries no tts.dist_landing: run analyze-distributed-desc first}}
+  tts.pin %mine {memory_space = "ct_local", offset = 8192 : i32} : tensor<64x32xf16>
+  tt.return %mine : tensor<64x32xf16>
+}

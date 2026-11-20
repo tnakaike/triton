@@ -341,6 +341,21 @@ static LogicalResult analyzeRead(triton::DescriptorLoadOp load,
   // condition is never evaluated where it does not run.
   std::reverse(guards.begin(), guards.end());
 
+  // The descriptor is a collective: every tile makes it. And the transfer is
+  // emitted ahead of these `if`s, which needs the composed source made there.
+  // So a descriptor made inside an `if` that guards a read through it is
+  // refused.
+  for (Guard &g : guards)
+    if (g.op->isAncestor(desc)) {
+      InFlightDiagnostic diag =
+          load.emitError()
+          << "the distributed descriptor this reads through is made inside an "
+             "if that guards the read; every tile makes the descriptor, so "
+             "make it outside";
+      diag.attachNote(g.op.getLoc()) << "this if";
+      return diag;
+    }
+
   ArrayRef<int64_t> block = desc.getBlockShape();
   unsigned rank = block.size();
   FailureOr<SmallVector<int64_t>> whole = composedShape(desc);

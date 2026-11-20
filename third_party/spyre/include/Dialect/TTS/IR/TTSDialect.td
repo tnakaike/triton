@@ -142,8 +142,8 @@ def TTS_Dialect : Dialect {
     /// view's work_slices in coordinates rather than slice indices.
     ///
     /// On the marker and not on the read, because the marker is what names
-    /// the landing. LowerDistributedDesc consumes it before LowerTTSMarkers
-    /// erases the marker; nothing carries the attribute past that.
+    /// the landing. LowerDistributedDesc consumes the attribute and the marker
+    /// together, so nothing carries it past that pass.
     static constexpr ::llvm::StringLiteral kDistLandingAttrName =
         "tts.dist_landing";
 

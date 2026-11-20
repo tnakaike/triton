@@ -214,15 +214,26 @@ def LowerDistributedDesc : Pass<"lower-distributed-desc", "mlir::ModuleOp"> {
         their results.
 
         Output: no tts.make_distributed_descriptor remains. A compose leaves one
-        ktdp.construct_memory_view per partition, a
-        ktdp.construct_distributed_memory_view over them, and an access tile plus
-        ktdp.load for each read that went through it.
+        ktdp.construct_memory_view per partition and a
+        ktdp.construct_distributed_memory_view over them: the src view.
 
-        The landing store a received tile needs before a compute unit can read it
-        is NOT emitted here. It is a tl.spyre_pin on the loaded value, and it is
-        honoured LATER than this pass rather than earlier: LowerTTSMarkers turns the
-        marker into an attribute at the end of this stage, and
-        MaterializePinnedBuffers builds the buffer at the head of `spyrecode`.
+        A read whose value a tts.pin marker lands is lowered from the
+        tts.dist_landing that AnalyzeDistributedDesc put on that marker, and is
+        refused without it. The dst tiles' landings, each in its tile's
+        scratchpad at the pin's offset, are composed into a dst view; the
+        transfer is a ktdp.load from the src view and a ktdp.store into the dst
+        view, emitted unguarded ahead of the outermost scf.if around the read,
+        at coordinates chosen per tile; and the read becomes a load of this
+        tile's own landing. The marker is consumed.
+
+        A read whose value is not pinned (a reduction's) is an access tile plus
+        ktdp.load on the src view, where the read was.
+
+        The share's own landing is not emitted here. It is a tl.spyre_pin on the
+        share, honoured LATER than this pass rather than earlier:
+        LowerTTSMarkers turns the marker into an attribute at the end of this
+        stage, and MaterializePinnedBuffers builds the buffer at the head of
+        `spyrecode`.
     }];
 
     let dependentDialects = [
