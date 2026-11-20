@@ -330,6 +330,106 @@ LogicalResult readTensorLayoutArrays(
   return success();
 }
 
+/// One coordinate list of `tts.dist_landing`: one entry per tile, a dense i64
+/// array or `unit`.
+static LogicalResult
+readCoordinateList(DictionaryAttr dict, StringRef name,
+                   SmallVectorImpl<std::optional<SmallVector<int64_t>>> &out,
+                   llvm::function_ref<InFlightDiagnostic()> emitError) {
+  auto list = dyn_cast_or_null<ArrayAttr>(dict.get(name));
+  if (!list)
+    return emitError() << "tts.dist_landing: '" << name
+                       << "' must be a list with one entry per tile";
+  for (auto [t, entry] : llvm::enumerate(list)) {
+    if (isa<UnitAttr>(entry)) {
+      out.push_back(std::nullopt);
+      continue;
+    }
+    auto coords = dyn_cast<DenseI64ArrayAttr>(entry);
+    if (!coords)
+      return emitError() << "tts.dist_landing: '" << name << "'[" << t
+                         << "] must be a dense i64 array, or unit for a tile "
+                            "that does not read";
+    for (int64_t c : coords.asArrayRef())
+      if (c < 0)
+        return emitError() << "tts.dist_landing: '" << name << "'[" << t
+                           << "] has a negative coordinate " << c;
+    out.push_back(SmallVector<int64_t>(coords.asArrayRef()));
+  }
+  return success();
+}
+
+LogicalResult
+readDistLanding(Attribute value, DistLanding &out,
+                llvm::function_ref<InFlightDiagnostic()> emitError) {
+  auto dict = dyn_cast<DictionaryAttr>(value);
+  if (!dict)
+    return emitError() << "tts.dist_landing: must be a dictionary of "
+                          "src_coordinates, dst_shape and dst_coordinates";
+
+  if (failed(readCoordinateList(dict, TTSDialect::kSrcCoordinatesName,
+                                out.srcCoordinates, emitError)))
+    return failure();
+  auto shape =
+      dyn_cast_or_null<DenseI64ArrayAttr>(dict.get(TTSDialect::kDstShapeName));
+  if (!shape)
+    return emitError() << "tts.dist_landing: 'dst_shape' must be a dense i64 "
+                          "array";
+  out.dstShape.assign(shape.asArrayRef().begin(), shape.asArrayRef().end());
+  if (failed(readCoordinateList(dict, TTSDialect::kDstCoordinatesName,
+                                out.dstCoordinates, emitError)))
+    return failure();
+  // Read by name, then counted, for the reason readTensorLayoutArrays gives.
+  if (dict.size() != 3)
+    return emitError() << "tts.dist_landing: expected exactly the entries "
+                          "src_coordinates, dst_shape and dst_coordinates, got "
+                       << dict.size() << " entries";
+
+  for (int64_t e : out.dstShape)
+    if (e <= 0)
+      return emitError() << "tts.dist_landing: 'dst_shape' has a non-positive "
+                            "extent "
+                         << e;
+
+  // Both lists are indexed by tile, so they describe the same tiles: the same
+  // length, and a tile reads on one side exactly when it lands on the other.
+  if (out.srcCoordinates.size() != out.dstCoordinates.size())
+    return emitError() << "tts.dist_landing: 'src_coordinates' has "
+                       << out.srcCoordinates.size()
+                       << " entries and 'dst_coordinates' has "
+                       << out.dstCoordinates.size()
+                       << ": both have one per tile";
+  bool anyReader = false;
+  unsigned rank = out.dstShape.size();
+  for (auto [t, src, dst] :
+       llvm::enumerate(out.srcCoordinates, out.dstCoordinates)) {
+    if (src.has_value() != dst.has_value())
+      return emitError() << "tts.dist_landing: tile " << t << " is unit in "
+                         << (src ? "'dst_coordinates'" : "'src_coordinates'")
+                         << " only: a tile that reads also lands";
+    if (!src)
+      continue;
+    anyReader = true;
+    // The read and the landing are one block, so the source rank is the
+    // destination's too.
+    if (src->size() != rank || dst->size() != rank)
+      return emitError() << "tts.dist_landing: tile " << t
+                         << "'s coordinates are not of the destination's rank "
+                         << rank;
+    for (unsigned d = 0; d < rank; ++d)
+      if ((*dst)[d] >= out.dstShape[d])
+        return emitError() << "tts.dist_landing: tile " << t
+                           << "'s destination coordinate " << (*dst)[d]
+                           << " on dimension " << d
+                           << " is outside the destination's extent "
+                           << out.dstShape[d];
+  }
+  if (!anyReader)
+    return emitError()
+           << "tts.dist_landing: no tile reads: every entry is unit";
+  return success();
+}
+
 LogicalResult TTSDialect::verifyOperationAttribute(Operation *op,
                                                    NamedAttribute attribute) {
   StringRef name = attribute.getName().strref();
@@ -377,6 +477,19 @@ LogicalResult TTSDialect::verifyOperationAttribute(Operation *op,
   // exactly that reason. That reader belongs with that consumer.
   if (name == kPinAttrName)
     return success();
+
+  // Unlike `tts.pin`, this one is not built from fields an op's verifier
+  // already passed: an analysis writes it, and hand-written IR can spell it. So
+  // its shape is checked here, through the same reader its consumer uses. Only
+  // on the marker it describes: on any other op it would be inert.
+  if (name == kDistLandingAttrName) {
+    if (!isa<PinOp>(op))
+      return op->emitError("'")
+             << kDistLandingAttrName
+             << "' describes a landing, so it belongs on a tts.pin marker";
+    DistLanding landing;
+    return readDistLanding(attribute.getValue(), landing, emitError);
+  }
 
   return op->emitError("attribute '")
          << name << "' is not one the tts dialect defines";

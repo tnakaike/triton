@@ -292,6 +292,29 @@ LogicalResult readWorkSliceTable(
     llvm::MapVector<StringRef, int64_t> &sliceCounts,
     llvm::function_ref<InFlightDiagnostic()> emitError);
 
+/// `tts.dist_landing`, read back. The two coordinate lists have one entry per
+/// dst tile and are nullopt at the same positions: the tiles that do not
+/// receive. srcCoordinates are in the src view, dstCoordinates in the dst view.
+struct DistLanding {
+  llvm::SmallVector<std::optional<llvm::SmallVector<int64_t>>> srcCoordinates;
+  llvm::SmallVector<int64_t> dstShape;
+  llvm::SmallVector<std::optional<llvm::SmallVector<int64_t>>> dstCoordinates;
+};
+
+/// Read `tts.dist_landing` and check its shape as an attribute: exactly the
+/// three entries; the two lists of equal length, `unit` at the same positions,
+/// at least one tile reading; every coordinate of the destination's rank, and
+/// every destination coordinate inside the destination.
+///
+/// Shared by the dialect's attribute verifier and by the lowering that consumes
+/// the attribute, for the reason readWorkSliceTable is shared. What it cannot
+/// check is anything that needs the read itself -- the block shape, the
+/// source's extent, the grid -- which is AnalyzeDistributedDesc's, the
+/// attribute's writer.
+LogicalResult
+readDistLanding(Attribute value, DistLanding &out,
+                llvm::function_ref<InFlightDiagnostic()> emitError);
+
 } // namespace mlir::triton::tts
 
 #endif // TRITON_SPYRE_DIALECT_TTS_IR_DIALECT_H

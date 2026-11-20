@@ -44,6 +44,12 @@ void mlir::triton::spyre::buildTTIRToKTIRPipeline(
   // MaterializePinnedBuffers honours it in `spyrecode` the marker is the only thing
   // holding the value against this stage's closing DCE. See LowerTTSMarkers'
   // contract for why that pass runs after the canonicalize.
+  //
+  // The analysis first: it evaluates each pinned read's `if` and coordinates
+  // per tile, so it needs `tt.get_program_id`, which DistributeWork (below)
+  // replaces, and the landing `tts.pin` marker it annotates, which
+  // LowerTTSMarkers erases.
+  pm.addPass(createAnalyzeDistributedDescPass(options.grid));
   pm.addPass(createLowerDistributedDescPass(options.grid));
 
   // tt.func/tt.return -> func.func/func.return, !tt.ptr -> index. Last of the

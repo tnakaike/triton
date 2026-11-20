@@ -169,6 +169,41 @@ def ConvertFunctions : Pass<"convert-ttir-functions", "mlir::ModuleOp"> {
     ];
 }
 
+def AnalyzeDistributedDesc : Pass<"analyze-distributed-desc", "mlir::ModuleOp"> {
+    let summary = "Find which tiles perform each pinned read through a "
+                  "tts.make_distributed_descriptor and where each block "
+                  "lands, and state it as tts.dist_landing.";
+    let description = [{
+        Input: TTIR at LowerDistributedDesc's position, where tt.get_program_id
+        still stands and the tts.pin markers have not been lowered.
+
+        For each tt.descriptor_load on a tts.make_distributed_descriptor result
+        whose value a tts.pin marker lands, the pass evaluates, once per tile
+        with tt.get_program_id x replaced by the tile id, the scf.if conditions
+        enclosing the read and the coordinates it passes. The tiles whose
+        conditions hold are the ones that read; the blocks they read, laid side
+        by side, are the destination. The result is written as the
+        tts.dist_landing dictionary on the landing marker (see TTSDialect.td).
+
+        What it refuses, each at the read's Triton line: a condition or a
+        coordinate that is not a constant on some tile (with a note at the value
+        that is not), a read inside anything but scf.if, a block outside the
+        composed source, two tiles reading the same block, and blocks that do
+        not tile a box.
+
+        The IR is otherwise unchanged. A read whose value is not pinned is
+        skipped: a reduction's read (design §7) is exempt from the landing, but
+        a copy's is not (§10), and telling the two apart is not done yet.
+    }];
+
+    // The tile count: `tt.get_program_id x` is evaluated at every tile of it.
+    let options = [
+        ListOption<"grid", "grid", "int64_t",
+                   "Per-axis partition of the Spyre hardware grid, as "
+                   "DistributeWork takes it. Default [32].">
+    ];
+}
+
 def LowerDistributedDesc : Pass<"lower-distributed-desc", "mlir::ModuleOp"> {
     let summary = "Lower tts.make_distributed_descriptor, and the reads through "
                   "it, to a composed ktdp memory view.";

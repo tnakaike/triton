@@ -114,6 +114,45 @@ def TTS_Dialect : Dialect {
     /// The two entry names of that dictionary.
     static constexpr ::llvm::StringLiteral kMemorySpaceName = "memory_space";
     static constexpr ::llvm::StringLiteral kOffsetName = "offset";
+
+    /// What AnalyzeDistributedDesc found about a read through a distributed
+    /// descriptor whose value lands in a pin, as a `DictionaryAttr` on that
+    /// LANDING `tts.pin` marker:
+    ///
+    ///   src_coordinates : one entry per DST TILE, in tile order. A dst tile is
+    ///                     a tile that receives: it performs the read, and the
+    ///                     value lands in its own scratchpad. Its entry is the
+    ///                     coordinates it passes to `.load()`, a
+    ///                     `DenseI64ArrayAttr` in the SRC VIEW (the composed
+    ///                     source's logical index space); a tile that does not
+    ///                     receive has `unit`.
+    ///   dst_shape       : the DST VIEW's extent, a `DenseI64ArrayAttr`. The
+    ///                     dst view is the composed destination, the union of
+    ///                     the blocks the dst tiles land, so on a dimension
+    ///                     they differ in it is their count times the block
+    ///                     extent, and elsewhere it is the block extent.
+    ///   dst_coordinates : one entry per dst tile, `unit` exactly where
+    ///                     src_coordinates is: where that dst tile's block
+    ///                     sits, in the DST VIEW's coordinates.
+    ///
+    /// Both lists are indexed by the dst tile, never by a tile holding part of
+    /// the source; which source tiles hold a read's block is the descriptor's
+    /// work_slices to say. One entry per tile, `unit` for a tile with nothing,
+    /// is the shape `work_slices` already has, so dst_coordinates is the dst
+    /// view's work_slices in coordinates rather than slice indices.
+    ///
+    /// On the marker and not on the read, because the marker is what names
+    /// the landing. LowerDistributedDesc consumes it before LowerTTSMarkers
+    /// erases the marker; nothing carries the attribute past that.
+    static constexpr ::llvm::StringLiteral kDistLandingAttrName =
+        "tts.dist_landing";
+
+    /// The three entry names of that dictionary.
+    static constexpr ::llvm::StringLiteral kSrcCoordinatesName =
+        "src_coordinates";
+    static constexpr ::llvm::StringLiteral kDstShapeName = "dst_shape";
+    static constexpr ::llvm::StringLiteral kDstCoordinatesName =
+        "dst_coordinates";
   }];
 
   let hasOperationAttrVerify = 1;
