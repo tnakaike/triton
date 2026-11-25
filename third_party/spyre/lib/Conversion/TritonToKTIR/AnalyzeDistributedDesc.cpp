@@ -25,6 +25,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -512,6 +513,83 @@ static LogicalResult analyzeRead(triton::DescriptorLoadOp load,
 }
 
 //===----------------------------------------------------------------------===//
+// An unpinned read: a reduction's, or refused
+//===----------------------------------------------------------------------===//
+
+/// The dimensions of the read's block that `user` folds, when `use` is the
+/// read's value as an input of a reduction. Empty when `user` is not a
+/// reduction taking the value as an input.
+static SmallVector<int64_t> foldedDims(Operation *user, OpOperand &use) {
+  if (auto reduce = dyn_cast<linalg::ReduceOp>(user)) {
+    if (use.getOperandNumber() < reduce.getInputs().size())
+      return SmallVector<int64_t>(reduce.getDimensions());
+    return {};
+  }
+  // A 2-D matmul contracts dimension 1 of its left operand and dimension 0 of
+  // its right one.
+  if (isa<linalg::MatmulOp>(user)) {
+    if (use.getOperandNumber() == 0)
+      return {1};
+    if (use.getOperandNumber() == 1)
+      return {0};
+  }
+  return {};
+}
+
+/// A read whose value does not land moves data between cores only as a
+/// reduction across them (design §7). The stack supports two moves today:
+/// scratchpad to scratchpad, which a pinned landing makes, and scratchpad
+/// straight into a reduction across cores. So every use of the value has to be
+/// a reduction taking it directly, and each has to fold a dimension the
+/// descriptor divides, since that fold is what crosses the cores.
+///
+/// Anything else is refused: a use that is not a reduction is a copy with no
+/// landing, and a fold over undivided dimensions only is a gather followed by a
+/// local reduction. That includes computing on the value first, element-wise or
+/// by folding an undivided dimension, and reducing the result across cores:
+/// each core could do that part on its own share, but whether the backend
+/// moves it there before the cross-core fold is not established, so the value
+/// has to land first.
+static LogicalResult checkReductionRead(triton::DescriptorLoadOp load,
+                                        tts::MakeDistributedDescriptorOp desc) {
+  llvm::SmallDenseSet<int64_t> divided;
+  for (auto [d, attr] : llvm::enumerate(desc.getAxes()))
+    if (!cast<StringAttr>(attr).getValue().empty())
+      divided.insert(d);
+
+  for (OpOperand &use : load.getResult().getUses()) {
+    Operation *user = use.getOwner();
+    SmallVector<int64_t> folded = foldedDims(user, use);
+    if (folded.empty()) {
+      InFlightDiagnostic diag =
+          load.emitError()
+          << "this read through a distributed descriptor is not pinned, and "
+             "its value is used by '"
+          << user->getName().getStringRef()
+          << "', which is not a reduction: a read either lands in the "
+             "scratchpad, pinned with tl.spyre_pin, or feeds a reduction "
+             "directly over a dimension the descriptor divides";
+      diag.attachNote(user->getLoc()) << "used here";
+      return diag;
+    }
+    if (llvm::any_of(folded, [&](int64_t d) { return divided.contains(d); }))
+      continue;
+    InFlightDiagnostic diag =
+        load.emitError()
+        << "this read through a distributed descriptor is not pinned, and "
+           "the reduction it feeds folds dimensions "
+        << formatCoords(folded)
+        << ", which the descriptor does not divide: that is a gather "
+           "followed by a local reduction, not a reduction across cores, "
+           "so the gathered block has to land; pin the read with "
+           "tl.spyre_pin";
+    diag.attachNote(user->getLoc()) << "the reduction";
+    return diag;
+  }
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // The pass
 //===----------------------------------------------------------------------===//
 
@@ -544,14 +622,12 @@ struct AnalyzeDistributedDescPass
       for (Operation *user : load.getResult().getUsers())
         if ((landing = dyn_cast<tts::PinOp>(user)))
           break;
-      // TODO: refuse an unpinned COPY. The design rejects a copy whose landing
-      // is not pinned (§10: a value received over the interconnect has to be
-      // resident in the scratchpad before a compute unit reads it) and exempts
-      // only a reduction (§7), whose folded value feeds the next computation
-      // directly. Telling the two apart belongs with the reduction's lowering,
-      // so until then every unpinned read is skipped, a copy included.
-      if (!landing)
+      // An unpinned read is admitted only as a reduction's read (§7).
+      if (!landing) {
+        if (failed(checkReductionRead(load, desc)))
+          failedAny = true;
         return;
+      }
       // A tile is `tt.get_program_id x` only on a one-axis grid. On more, the
       // tile id is DistributeWork's linearization of every axis, which this
       // evaluator does not model.

@@ -229,3 +229,165 @@ tt.func @descriptor_inside_the_guard(%x: tensor<1x64xf16>) {
   }
   tt.return
 }
+
+// -----
+// The reads below are not pinned, so each has to be a reduction's read (§7): the
+// stack moves data between cores only scratchpad to scratchpad, through a pinned
+// landing, or straight into a reduction across cores, so every use has to be a
+// reduction taking the value directly. The four shares are composed on n,
+// dimension 1, in every case.
+
+// A copy with no landing: the gathered block is returned as it is.
+tt.func @copy_without_a_landing(%x: tensor<4x16xf16>) -> tensor<4x64xf16> {
+  %share = math.exp %x : tensor<4x16xf16>
+  tts.pin %share {memory_space = "ct_local", offset = 0 : i32} : tensor<4x16xf16>
+  %w = tts.make_distributed_descriptor %share
+      {work_slices = [{n = 0 : i64}, {n = 1 : i64}, {n = 2 : i64}, {n = 3 : i64}],
+       axes = ["", "n"], block_shape = array<i64: 4, 64>}
+      : tensor<4x16xf16> -> !tt.tensordesc<4x64xf16>
+  %c0 = arith.constant 0 : i32
+  // expected-error @+1 {{this read through a distributed descriptor is not pinned, and its value is used by 'tt.return', which is not a reduction: a read either lands in the scratchpad, pinned with tl.spyre_pin, or feeds a reduction directly over a dimension the descriptor divides}}
+  %v = tt.descriptor_load %w[%c0, %c0] : !tt.tensordesc<4x64xf16> -> tensor<4x64xf16>
+  // expected-note @+1 {{used here}}
+  tt.return %v : tensor<4x64xf16>
+}
+
+// -----
+// Computing on the value is a use that is not a reduction, whatever follows it.
+tt.func @element_wise_then_a_copy(%x: tensor<4x16xf16>) -> tensor<4x64xf16> {
+  %share = math.exp %x : tensor<4x16xf16>
+  tts.pin %share {memory_space = "ct_local", offset = 0 : i32} : tensor<4x16xf16>
+  %w = tts.make_distributed_descriptor %share
+      {work_slices = [{n = 0 : i64}, {n = 1 : i64}, {n = 2 : i64}, {n = 3 : i64}],
+       axes = ["", "n"], block_shape = array<i64: 4, 64>}
+      : tensor<4x16xf16> -> !tt.tensordesc<4x64xf16>
+  %c0 = arith.constant 0 : i32
+  // expected-error @+1 {{this read through a distributed descriptor is not pinned, and its value is used by 'math.exp', which is not a reduction: a read either lands in the scratchpad, pinned with tl.spyre_pin, or feeds a reduction directly over a dimension the descriptor divides}}
+  %v = tt.descriptor_load %w[%c0, %c0] : !tt.tensordesc<4x64xf16> -> tensor<4x64xf16>
+  // expected-note @+1 {{used here}}
+  %e = math.exp %v : tensor<4x64xf16>
+  tt.return %e : tensor<4x64xf16>
+}
+
+// -----
+// A reduction and a copy of one read: the reduction is fine, the copy is not.
+tt.func @a_reduction_and_a_copy(%x: tensor<4x16xf16>) -> (tensor<4xf16>, tensor<4x64xf16>) {
+  %share = math.exp %x : tensor<4x16xf16>
+  tts.pin %share {memory_space = "ct_local", offset = 0 : i32} : tensor<4x16xf16>
+  %w = tts.make_distributed_descriptor %share
+      {work_slices = [{n = 0 : i64}, {n = 1 : i64}, {n = 2 : i64}, {n = 3 : i64}],
+       axes = ["", "n"], block_shape = array<i64: 4, 64>}
+      : tensor<4x16xf16> -> !tt.tensordesc<4x64xf16>
+  %c0 = arith.constant 0 : i32
+  // expected-error @+1 {{this read through a distributed descriptor is not pinned, and its value is used by 'tt.return', which is not a reduction: a read either lands in the scratchpad, pinned with tl.spyre_pin, or feeds a reduction directly over a dimension the descriptor divides}}
+  %v = tt.descriptor_load %w[%c0, %c0] : !tt.tensordesc<4x64xf16> -> tensor<4x64xf16>
+  %zero = arith.constant 0.0 : f16
+  %empty = tensor.empty() : tensor<4xf16>
+  %init = linalg.fill ins(%zero : f16) outs(%empty : tensor<4xf16>) -> tensor<4xf16>
+  %r = linalg.reduce ins(%v : tensor<4x64xf16>) outs(%init : tensor<4xf16>) dimensions = [1]
+    (%in: f16, %acc: f16) {
+      %s = arith.addf %in, %acc : f16
+      linalg.yield %s : f16
+    }
+  // expected-note @+1 {{used here}}
+  tt.return %r, %v : tensor<4xf16>, tensor<4x64xf16>
+}
+
+// -----
+// A reduction over dimension 0, which the descriptor does not divide: each core's
+// columns are summed down, a gather followed by a local reduction, not a
+// reduction across cores. The gathered block has to land.
+tt.func @reduction_over_an_undivided_dimension(%x: tensor<4x16xf16>) -> tensor<64xf16> {
+  %share = math.exp %x : tensor<4x16xf16>
+  tts.pin %share {memory_space = "ct_local", offset = 0 : i32} : tensor<4x16xf16>
+  %w = tts.make_distributed_descriptor %share
+      {work_slices = [{n = 0 : i64}, {n = 1 : i64}, {n = 2 : i64}, {n = 3 : i64}],
+       axes = ["", "n"], block_shape = array<i64: 4, 64>}
+      : tensor<4x16xf16> -> !tt.tensordesc<4x64xf16>
+  %c0 = arith.constant 0 : i32
+  // expected-error @+1 {{this read through a distributed descriptor is not pinned, and the reduction it feeds folds dimensions [0], which the descriptor does not divide: that is a gather followed by a local reduction, not a reduction across cores, so the gathered block has to land; pin the read with tl.spyre_pin}}
+  %v = tt.descriptor_load %w[%c0, %c0] : !tt.tensordesc<4x64xf16> -> tensor<4x64xf16>
+  %zero = arith.constant 0.0 : f16
+  %empty = tensor.empty() : tensor<64xf16>
+  %init = linalg.fill ins(%zero : f16) outs(%empty : tensor<64xf16>) -> tensor<64xf16>
+  // expected-note @+1 {{the reduction}}
+  %r = linalg.reduce ins(%v : tensor<4x64xf16>) outs(%init : tensor<64xf16>) dimensions = [0]
+    (%in: f16, %acc: f16) {
+      %s = arith.addf %in, %acc : f16
+      linalg.yield %s : f16
+    }
+  tt.return %r : tensor<64xf16>
+}
+
+// -----
+// An operation that changes the shape: after the transpose, dimension 0 is the
+// divided one, so the fold below would cross the cores, but the dimensions are
+// not followed through a shape change, so it is refused like a copy.
+tt.func @a_transpose_before_the_reduction(%x: tensor<4x16xf16>) -> tensor<4xf16> {
+  %share = math.exp %x : tensor<4x16xf16>
+  tts.pin %share {memory_space = "ct_local", offset = 0 : i32} : tensor<4x16xf16>
+  %w = tts.make_distributed_descriptor %share
+      {work_slices = [{n = 0 : i64}, {n = 1 : i64}, {n = 2 : i64}, {n = 3 : i64}],
+       axes = ["", "n"], block_shape = array<i64: 4, 64>}
+      : tensor<4x16xf16> -> !tt.tensordesc<4x64xf16>
+  %c0 = arith.constant 0 : i32
+  // expected-error @+1 {{this read through a distributed descriptor is not pinned, and its value is used by 'tt.trans', which is not a reduction: a read either lands in the scratchpad, pinned with tl.spyre_pin, or feeds a reduction directly over a dimension the descriptor divides}}
+  %v = tt.descriptor_load %w[%c0, %c0] : !tt.tensordesc<4x64xf16> -> tensor<4x64xf16>
+  // expected-note @+1 {{used here}}
+  %t = tt.trans %v {order = array<i32: 1, 0>} : tensor<4x64xf16> -> tensor<64x4xf16>
+  %zero = arith.constant 0.0 : f16
+  %empty = tensor.empty() : tensor<4xf16>
+  %init = linalg.fill ins(%zero : f16) outs(%empty : tensor<4xf16>) -> tensor<4xf16>
+  %r = linalg.reduce ins(%t : tensor<64x4xf16>) outs(%init : tensor<4xf16>) dimensions = [0]
+    (%in: f16, %acc: f16) {
+      %s = arith.addf %in, %acc : f16
+      linalg.yield %s : f16
+    }
+  tt.return %r : tensor<4xf16>
+}
+
+// -----
+// A pin on a value computed from the read is not the read's landing: the
+// computation would read the received block before it lands.
+tt.func @pin_after_a_computation(%x: tensor<4x16xf16>) {
+  %share = math.exp %x : tensor<4x16xf16>
+  tts.pin %share {memory_space = "ct_local", offset = 0 : i32} : tensor<4x16xf16>
+  %w = tts.make_distributed_descriptor %share
+      {work_slices = [{n = 0 : i64}, {n = 1 : i64}, {n = 2 : i64}, {n = 3 : i64}],
+       axes = ["", "n"], block_shape = array<i64: 4, 64>}
+      : tensor<4x16xf16> -> !tt.tensordesc<4x64xf16>
+  %c0 = arith.constant 0 : i32
+  // expected-error @+1 {{this read through a distributed descriptor is not pinned, and its value is used by 'math.exp', which is not a reduction: a read either lands in the scratchpad, pinned with tl.spyre_pin, or feeds a reduction directly over a dimension the descriptor divides}}
+  %v = tt.descriptor_load %w[%c0, %c0] : !tt.tensordesc<4x64xf16> -> tensor<4x64xf16>
+  // expected-note @+1 {{used here}}
+  %e = math.exp %v : tensor<4x64xf16>
+  tts.pin %e {memory_space = "ct_local", offset = 4096 : i32} : tensor<4x64xf16>
+  tt.return
+}
+
+// -----
+// An element-wise operation before a reduction across cores. Each core could
+// apply it to its own share before the fold, but whether the backend moves it
+// there is not established, so the value has to land first.
+tt.func @element_wise_before_the_reduction(%x: tensor<4x16xf16>, %y: tensor<4x64xf16>) -> tensor<4xf16> {
+  %share = math.exp %x : tensor<4x16xf16>
+  tts.pin %share {memory_space = "ct_local", offset = 0 : i32} : tensor<4x16xf16>
+  %w = tts.make_distributed_descriptor %share
+      {work_slices = [{n = 0 : i64}, {n = 1 : i64}, {n = 2 : i64}, {n = 3 : i64}],
+       axes = ["", "n"], block_shape = array<i64: 4, 64>}
+      : tensor<4x16xf16> -> !tt.tensordesc<4x64xf16>
+  %c0 = arith.constant 0 : i32
+  // expected-error @+1 {{this read through a distributed descriptor is not pinned, and its value is used by 'arith.mulf', which is not a reduction: a read either lands in the scratchpad, pinned with tl.spyre_pin, or feeds a reduction directly over a dimension the descriptor divides}}
+  %v = tt.descriptor_load %w[%c0, %c0] : !tt.tensordesc<4x64xf16> -> tensor<4x64xf16>
+  // expected-note @+1 {{used here}}
+  %m = arith.mulf %v, %y : tensor<4x64xf16>
+  %zero = arith.constant 0.0 : f16
+  %empty = tensor.empty() : tensor<4xf16>
+  %init = linalg.fill ins(%zero : f16) outs(%empty : tensor<4xf16>) -> tensor<4xf16>
+  %r = linalg.reduce ins(%m : tensor<4x64xf16>) outs(%init : tensor<4xf16>) dimensions = [1]
+    (%in: f16, %acc: f16) {
+      %s = arith.addf %in, %acc : f16
+      linalg.yield %s : f16
+    }
+  tt.return %r : tensor<4xf16>
+}

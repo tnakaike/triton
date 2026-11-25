@@ -194,9 +194,15 @@ def AnalyzeDistributedDesc : Pass<"analyze-distributed-desc", "mlir::ModuleOp"> 
         blocks that do not tile a box, and blocks read by differing numbers of
         tiles.
 
-        The IR is otherwise unchanged. A read whose value is not pinned is
-        skipped: a reduction's read (design §7) is exempt from the landing, but
-        a copy's is not (§10), and telling the two apart is not done yet.
+        A read whose value is not pinned has no landing and gets no attribute:
+        it is admitted only as a reduction's read (design §7): every use of its
+        value is a linalg.reduce or linalg.matmul taking it directly and
+        folding a dimension the descriptor divides. Any other use, a
+        computation on the value included, is a copy with no landing, and a
+        fold over only undivided dimensions is a gather followed by a local
+        reduction; both are refused (§10).
+
+        The IR is otherwise unchanged.
     }];
 
     // The tile count: `tt.get_program_id x` is evaluated at every tile of it.

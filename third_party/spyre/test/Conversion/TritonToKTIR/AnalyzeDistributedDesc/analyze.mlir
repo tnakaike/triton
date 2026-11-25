@@ -171,23 +171,62 @@ tt.func @num_programs(%x: tensor<1x64xf16>) {
 }
 
 // -----
-// A read whose value is not pinned is skipped: no attribute, and no requirement
-// on its coordinates. That is right for a reduction's read (§7), which needs no
-// landing. A copy's would have to be refused (§10), which the pass does not do
-// yet (the TODO in AnalyzeDistributedDesc.cpp); when it does, this case, whose
-// value feeds no reduction, becomes an error.
-// CHECK-LABEL: tt.func @unpinned_read
+// A read whose value is not pinned is a reduction's read (§7): no landing and no
+// attribute, and the analysis only checks that every use is a reduction taking
+// the value directly and folding a dimension the descriptor divides. Here the four shares are composed on n
+// (dimension 1), and tl.sum folds it: a reduction across cores.
+// CHECK-LABEL: tt.func @reduction_over_the_divided_dimension
 // CHECK-NOT: tts.dist_landing
-tt.func @unpinned_read(%x: tensor<1x64xf16>, %row: i32) -> tensor<1x64xf16> {
-  %share = math.exp %x : tensor<1x64xf16>
-  tts.pin %share {memory_space = "ct_local", offset = 0 : i32} : tensor<1x64xf16>
+tt.func @reduction_over_the_divided_dimension(%x: tensor<4x16xf16>) -> tensor<4xf16> {
+  %share = math.exp %x : tensor<4x16xf16>
+  tts.pin %share {memory_space = "ct_local", offset = 0 : i32} : tensor<4x16xf16>
   %w = tts.make_distributed_descriptor %share
-      {work_slices = [{mb = 0 : i64}, {mb = 1 : i64}, {mb = 2 : i64}, {mb = 3 : i64}],
-       axes = ["mb", ""], block_shape = array<i64: 1, 64>}
-      : tensor<1x64xf16> -> !tt.tensordesc<1x64xf16>
+      {work_slices = [{n = 0 : i64}, {n = 1 : i64}, {n = 2 : i64}, {n = 3 : i64}],
+       axes = ["", "n"], block_shape = array<i64: 4, 64>}
+      : tensor<4x16xf16> -> !tt.tensordesc<4x64xf16>
   %c0 = arith.constant 0 : i32
-  %v = tt.descriptor_load %w[%row, %c0] : !tt.tensordesc<1x64xf16> -> tensor<1x64xf16>
-  tt.return %v : tensor<1x64xf16>
+  %v = tt.descriptor_load %w[%c0, %c0] : !tt.tensordesc<4x64xf16> -> tensor<4x64xf16>
+  %zero = arith.constant 0.0 : f16
+  %empty = tensor.empty() : tensor<4xf16>
+  %init = linalg.fill ins(%zero : f16) outs(%empty : tensor<4xf16>) -> tensor<4xf16>
+  %r = linalg.reduce ins(%v : tensor<4x64xf16>) outs(%init : tensor<4xf16>) dimensions = [1]
+    (%in: f16, %acc: f16) {
+      %s = arith.addf %in, %acc : f16
+      linalg.yield %s : f16
+    }
+  tt.return %r : tensor<4xf16>
+}
+
+// -----
+// A matmul whose contracted dimension is the divided one, on either side: the
+// left operand's dimension 1 here, the right operand's dimension 0 below. This
+// is the K-split of §7, the cross-core reduction being the contraction.
+// CHECK-LABEL: tt.func @matmul_contracting_the_divided_dimension
+// CHECK-NOT: tts.dist_landing
+tt.func @matmul_contracting_the_divided_dimension(%x: tensor<4x16xf16>, %b: tensor<64x8xf16>,
+                                                   %bx: tensor<16x8xf16>, %a: tensor<4x64xf16>)
+    -> (tensor<4x8xf16>, tensor<4x8xf16>) {
+  %share = math.exp %x : tensor<4x16xf16>
+  tts.pin %share {memory_space = "ct_local", offset = 0 : i32} : tensor<4x16xf16>
+  %w = tts.make_distributed_descriptor %share
+      {work_slices = [{n = 0 : i64}, {n = 1 : i64}, {n = 2 : i64}, {n = 3 : i64}],
+       axes = ["", "n"], block_shape = array<i64: 4, 64>}
+      : tensor<4x16xf16> -> !tt.tensordesc<4x64xf16>
+  %c0 = arith.constant 0 : i32
+  %v = tt.descriptor_load %w[%c0, %c0] : !tt.tensordesc<4x64xf16> -> tensor<4x64xf16>
+  %zero = arith.constant 0.0 : f16
+  %empty = tensor.empty() : tensor<4x8xf16>
+  %init = linalg.fill ins(%zero : f16) outs(%empty : tensor<4x8xf16>) -> tensor<4x8xf16>
+  %c = linalg.matmul ins(%v, %b : tensor<4x64xf16>, tensor<64x8xf16>) outs(%init : tensor<4x8xf16>) -> tensor<4x8xf16>
+  %bshare = math.exp %bx : tensor<16x8xf16>
+  tts.pin %bshare {memory_space = "ct_local", offset = 2048 : i32} : tensor<16x8xf16>
+  %bw = tts.make_distributed_descriptor %bshare
+      {work_slices = [{k = 0 : i64}, {k = 1 : i64}, {k = 2 : i64}, {k = 3 : i64}],
+       axes = ["k", ""], block_shape = array<i64: 64, 8>}
+      : tensor<16x8xf16> -> !tt.tensordesc<64x8xf16>
+  %bv = tt.descriptor_load %bw[%c0, %c0] : !tt.tensordesc<64x8xf16> -> tensor<64x8xf16>
+  %d = linalg.matmul ins(%a, %bv : tensor<4x64xf16>, tensor<64x8xf16>) outs(%init : tensor<4x8xf16>) -> tensor<4x8xf16>
+  tt.return %c, %d : tensor<4x8xf16>, tensor<4x8xf16>
 }
 
 // -----
